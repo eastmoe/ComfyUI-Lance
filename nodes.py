@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import copy
 import gc
+import hashlib
+import json
 import os
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from fractions import Fraction
@@ -21,6 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 COMFY_ROOT = REPO_ROOT.parent.parent
 LANCE_SRC = REPO_ROOT / "Lance"
 LANCE_REPO_ID = "bytedance-research/Lance"
+QUANTIZATION_CACHE_DIR_NAME = "Lance-quantized-cache"
 CATEGORY = "Lance/多模态"
 
 if str(COMFY_ROOT) not in sys.path and (COMFY_ROOT / "folder_paths.py").is_file():
@@ -374,6 +378,241 @@ def _set_attention_impl(config: Any, implementation: str) -> None:
     config._attn_implementation_internal = implementation
 
 
+def _normalize_quantization_mode(quantization: str) -> Optional[str]:
+    mode = (quantization or "none").strip().lower()
+    if mode in {"none", "off", "false", ""}:
+        return None
+    if mode in {"int8", "int4", "fp8_e4m3fn", "fp8_e5m2", "fp8"}:
+        return mode
+    raise ValueError(f"不支持的量化格式: {mode}")
+
+
+def _lance_quantization_cache_dir() -> Path:
+    return _comfy_models_dir() / QUANTIZATION_CACHE_DIR_NAME
+
+
+def _checkpoint_file(path: Path) -> Path:
+    model_path = path / "model.safetensors"
+    if model_path.is_file():
+        return model_path
+    ema_path = path / "ema.safetensors"
+    if ema_path.is_file():
+        return ema_path
+    raise FileNotFoundError(f"找不到 Lance checkpoint: {path}")
+
+
+_SAFETENSORS_DTYPES: dict[str, torch.dtype] = {
+    "BOOL": torch.bool,
+    "U8": torch.uint8,
+    "I8": torch.int8,
+    "I16": torch.int16,
+    "I32": torch.int32,
+    "I64": torch.int64,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+}
+
+
+class _PlainSafetensorsReader:
+    """Read safetensors tensors without mmap, which can trip Windows pagefile limits."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._file = None
+        self._header: dict[str, Any] = {}
+        self._data_start = 0
+
+    def __enter__(self) -> "_PlainSafetensorsReader":
+        self._file = open(self.path, "rb")
+        header_len_bytes = self._file.read(8)
+        if len(header_len_bytes) != 8:
+            raise ValueError(f"无效 safetensors 文件: {self.path}")
+        header_len = int.from_bytes(header_len_bytes, "little")
+        header_raw = self._file.read(header_len)
+        if len(header_raw) != header_len:
+            raise ValueError(f"safetensors header 不完整: {self.path}")
+        self._header = json.loads(header_raw.decode("utf-8"))
+        self._data_start = 8 + header_len
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    def keys(self) -> list[str]:
+        return [key for key in self._header if key != "__metadata__"]
+
+    def get_tensor(self, key: str, *, clone: bool = False) -> torch.Tensor:
+        if self._file is None:
+            raise RuntimeError("safetensors reader is not open")
+        item = self._header[key]
+        dtype_name = item["dtype"]
+        dtype = _SAFETENSORS_DTYPES.get(dtype_name)
+        if dtype is None:
+            raise ValueError(f"暂不支持 safetensors dtype: {dtype_name}")
+        shape = tuple(int(dim) for dim in item["shape"])
+        start, end = (int(offset) for offset in item["data_offsets"])
+        self._file.seek(self._data_start + start)
+        raw = self._file.read(end - start)
+        if len(raw) != end - start:
+            raise ValueError(f"tensor {key!r} 数据不完整: {self.path}")
+        tensor = torch.frombuffer(raw, dtype=dtype).reshape(shape)
+        return tensor.clone() if clone else tensor
+
+
+def _file_signature(path: Path, label: Optional[str] = None) -> dict[str, Any]:
+    stat = path.stat()
+    return {
+        "name": label or path.name,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _lance_checkpoint_signature(model_path: Path, vit_path: Path) -> dict[str, Any]:
+    files: list[dict[str, Any]] = []
+    for filename in (
+        "llm_config.json",
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+    ):
+        candidate = model_path / filename
+        if candidate.exists():
+            files.append(_file_signature(candidate))
+
+    checkpoint = _checkpoint_file(model_path)
+    files.append(_file_signature(checkpoint))
+
+    vit_files: list[dict[str, Any]] = []
+    for filename in ("config.json", "preprocessor_config.json", "vit.safetensors"):
+        candidate = vit_path / filename
+        if candidate.exists():
+            vit_files.append(_file_signature(candidate))
+
+    return {
+        "model_path": str(model_path.resolve()),
+        "checkpoint": checkpoint.name,
+        "vit_path": str(vit_path.resolve()),
+        "files": sorted(files, key=lambda item: item["name"]),
+        "vit_files": sorted(vit_files, key=lambda item: item["name"]),
+    }
+
+
+def _signature_digest(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _quantization_cache_path(cache_dir: Path, model_path: Path, vit_path: Path, mode: str) -> tuple[Path, dict[str, Any]]:
+    metadata = {
+        "cache_version": 2,
+        "format": "lance-weight-only-state-dict",
+        "mode": mode,
+        "signature": _lance_checkpoint_signature(model_path, vit_path),
+    }
+    filename = f"{model_path.name}-{mode}-{_signature_digest(metadata)}.pt"
+    return cache_dir / filename, metadata
+
+
+def _torch_load_weights(path: Path, map_location: str | torch.device):
+    try:
+        return torch.load(str(path), map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(str(path), map_location=map_location)
+
+
+def _split_tensor_name(name: str) -> tuple[str, str]:
+    if "." not in name:
+        return "", name
+    return name.rsplit(".", 1)
+
+
+def _replace_module(model: torch.nn.Module, module_name: str, module: torch.nn.Module) -> None:
+    parent_name, child_name = _split_tensor_name(module_name)
+    parent = model.get_submodule(parent_name) if parent_name else model
+    setattr(parent, child_name, module)
+
+
+def _set_module_tensor(model: torch.nn.Module, tensor_name: str, tensor: torch.Tensor) -> None:
+    module_name, attr_name = _split_tensor_name(tensor_name)
+    module = model.get_submodule(module_name) if module_name else model
+    if attr_name in module._parameters:
+        old_param = module._parameters[attr_name]
+        requires_grad = bool(old_param.requires_grad) if old_param is not None else False
+        module._parameters[attr_name] = torch.nn.Parameter(tensor, requires_grad=requires_grad)
+        return
+    if attr_name in module._buffers:
+        module._buffers[attr_name] = tensor
+        return
+    raise KeyError(f"无法放置 tensor {tensor_name!r}: 目标属性不存在。")
+
+
+def _quantization_chunk_rows(weight: torch.Tensor, mode: str) -> int:
+    if weight.ndim != 2 or weight.shape[1] == 0:
+        return 1
+    max_temp_mb = int(os.environ.get("LANCE_QUANTIZE_MAX_TEMP_MB", "256"))
+    multiplier = 4 if mode == "int4" else 2
+    bytes_per_row = max(1, weight.shape[1] * multiplier * 4)
+    return max(1, min(weight.shape[0], (max_temp_mb * 1024 * 1024) // bytes_per_row))
+
+
+def _quantize_weight_tensor(
+    weight: torch.Tensor,
+    mode: str,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], str, Optional[torch.dtype]]:
+    if weight.ndim != 2:
+        raise ValueError(f"只能量化 2D Linear 权重，实际 shape={tuple(weight.shape)}")
+
+    mode = mode.lower()
+    weight = weight.detach().cpu()
+    out_features, in_features = weight.shape
+    chunk_rows = _quantization_chunk_rows(weight, mode)
+
+    if mode == "int8":
+        qweight = torch.empty((out_features, in_features), dtype=torch.int8)
+        scale = torch.empty((out_features,), dtype=torch.float32)
+        for start in range(0, out_features, chunk_rows):
+            end = min(start + chunk_rows, out_features)
+            chunk = weight[start:end].float()
+            chunk_scale = chunk.abs().amax(dim=1).clamp(min=1e-8) / 127.0
+            qweight[start:end] = torch.round(chunk / chunk_scale[:, None]).clamp(-127, 127).to(torch.int8)
+            scale[start:end] = chunk_scale
+        return qweight, scale, "int8", None
+
+    if mode == "int4":
+        qweight = torch.empty((out_features, (in_features + 1) // 2), dtype=torch.uint8)
+        scale = torch.empty((out_features,), dtype=torch.float32)
+        for start in range(0, out_features, chunk_rows):
+            end = min(start + chunk_rows, out_features)
+            chunk = weight[start:end].float()
+            chunk_scale = chunk.abs().amax(dim=1).clamp(min=1e-8) / 7.0
+            q = torch.round(chunk / chunk_scale[:, None]).clamp(-8, 7).to(torch.int8)
+            q = (q + 8).to(torch.uint8)
+            if in_features % 2:
+                q = torch.nn.functional.pad(q, (0, 1))
+            qweight[start:end] = q[:, 0::2] | (q[:, 1::2] << 4)
+            scale[start:end] = chunk_scale
+        return qweight, scale, "int4", None
+
+    if mode in {"fp8_e4m3fn", "fp8"}:
+        if not hasattr(torch, "float8_e4m3fn"):
+            raise RuntimeError("当前 PyTorch 不支持 torch.float8_e4m3fn。")
+        return weight.to(torch.float8_e4m3fn), None, "fp8", torch.float8_e4m3fn
+
+    if mode == "fp8_e5m2":
+        if not hasattr(torch, "float8_e5m2"):
+            raise RuntimeError("当前 PyTorch 不支持 torch.float8_e5m2。")
+        return weight.to(torch.float8_e5m2), None, "fp8", torch.float8_e5m2
+
+    raise ValueError(f"不支持的量化格式: {mode}")
+
+
 class QuantizedLinear(torch.nn.Module):
     def __init__(
         self,
@@ -404,32 +643,37 @@ class QuantizedLinear(torch.nn.Module):
     def from_linear(cls, module: torch.nn.Linear, mode: str) -> "QuantizedLinear":
         weight = module.weight.detach().float().cpu()
         bias = module.bias.detach().cpu() if module.bias is not None else None
-        mode = mode.lower()
-        if mode == "int8":
-            scale = weight.abs().amax(dim=1).clamp(min=1e-8) / 127.0
-            qweight = torch.round(weight / scale[:, None]).clamp(-127, 127).to(torch.int8)
-            return cls(qweight, scale, bias, module.in_features, module.out_features, mode)
-        if mode == "int4":
-            scale = weight.abs().amax(dim=1).clamp(min=1e-8) / 7.0
-            q = torch.round(weight / scale[:, None]).clamp(-8, 7).to(torch.int8)
-            q = (q + 8).to(torch.uint8)
-            if q.shape[1] % 2:
-                q = torch.nn.functional.pad(q, (0, 1))
-            low = q[:, 0::2]
-            high = q[:, 1::2] << 4
-            qweight = low | high
-            return cls(qweight, scale, bias, module.in_features, module.out_features, mode)
-        if mode in {"fp8_e4m3fn", "fp8"}:
-            if not hasattr(torch, "float8_e4m3fn"):
-                raise RuntimeError("当前 PyTorch 不支持 torch.float8_e4m3fn。")
-            dtype = torch.float8_e4m3fn
-            return cls(weight.to(dtype), None, bias, module.in_features, module.out_features, "fp8", dtype)
-        if mode == "fp8_e5m2":
-            if not hasattr(torch, "float8_e5m2"):
-                raise RuntimeError("当前 PyTorch 不支持 torch.float8_e5m2。")
-            dtype = torch.float8_e5m2
-            return cls(weight.to(dtype), None, bias, module.in_features, module.out_features, "fp8", dtype)
-        raise ValueError(f"不支持的量化格式: {mode}")
+        qweight, scale, internal_mode, fp8_dtype = _quantize_weight_tensor(weight, mode)
+        return cls(qweight, scale, bias, module.in_features, module.out_features, internal_mode, fp8_dtype)
+
+    @classmethod
+    def from_quantized_tensors(
+        cls,
+        *,
+        qweight: torch.Tensor,
+        scale: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        in_features: int,
+        out_features: int,
+        mode: str,
+        fp8_dtype: Optional[torch.dtype] = None,
+    ) -> "QuantizedLinear":
+        module = cls.__new__(cls)
+        torch.nn.Module.__init__(module)
+        module.in_features = int(in_features)
+        module.out_features = int(out_features)
+        module.mode = mode
+        module.fp8_dtype = fp8_dtype
+        module.register_buffer("qweight", qweight)
+        if scale is not None:
+            module.register_buffer("scale", scale)
+        else:
+            module.scale = None
+        if bias is not None:
+            module.register_buffer("bias", bias)
+        else:
+            module.bias = None
+        return module
 
     def _apply(self, fn):  # keep float8 storage from being promoted by module.to(dtype=...)
         qweight = self._buffers.pop("qweight")
@@ -462,18 +706,213 @@ class QuantizedLinear(torch.nn.Module):
         return torch.nn.functional.linear(input, weight, bias)
 
 
-def _replace_linear_modules(module: torch.nn.Module, quantization: str) -> int:
-    mode = (quantization or "none").strip().lower()
-    if mode in {"none", "off", "false"}:
+def _linear_like_weight_ptr(module: torch.nn.Module) -> Optional[int]:
+    weight = getattr(module, "weight", None)
+    if isinstance(weight, torch.Tensor):
+        return int(weight.data.data_ptr())
+    if isinstance(module, QuantizedLinear):
+        return int(module.qweight.data_ptr())
+    return None
+
+
+def _embeddings_share_plain_weight(
+    input_embeddings: torch.nn.Module,
+    output_embeddings: torch.nn.Module,
+) -> bool:
+    if isinstance(input_embeddings, QuantizedLinear) or isinstance(output_embeddings, QuantizedLinear):
+        return False
+    input_ptr = _linear_like_weight_ptr(input_embeddings)
+    output_ptr = _linear_like_weight_ptr(output_embeddings)
+    return input_ptr is not None and output_ptr is not None and input_ptr == output_ptr
+
+
+def _empty_quantized_linear_from_linear(
+    linear: torch.nn.Linear,
+    mode: str,
+    *,
+    has_bias: bool,
+) -> QuantizedLinear:
+    out_features = linear.out_features
+    in_features = linear.in_features
+    mode = mode.lower()
+    fp8_dtype = None
+    if mode == "int8":
+        qweight = torch.empty((out_features, in_features), dtype=torch.int8, device="meta")
+        scale = torch.empty((out_features,), dtype=torch.float32, device="meta")
+        internal_mode = "int8"
+    elif mode == "int4":
+        qweight = torch.empty((out_features, (in_features + 1) // 2), dtype=torch.uint8, device="meta")
+        scale = torch.empty((out_features,), dtype=torch.float32, device="meta")
+        internal_mode = "int4"
+    elif mode in {"fp8_e4m3fn", "fp8"}:
+        fp8_dtype = getattr(torch, "float8_e4m3fn", torch.uint8)
+        qweight = torch.empty((out_features, in_features), dtype=fp8_dtype, device="meta")
+        scale = None
+        internal_mode = "fp8"
+    elif mode == "fp8_e5m2":
+        fp8_dtype = getattr(torch, "float8_e5m2", torch.uint8)
+        qweight = torch.empty((out_features, in_features), dtype=fp8_dtype, device="meta")
+        scale = None
+        internal_mode = "fp8"
+    else:
+        raise ValueError(f"不支持的量化格式: {mode}")
+
+    bias = torch.empty((out_features,), dtype=linear.weight.dtype, device="meta") if has_bias else None
+    return QuantizedLinear.from_quantized_tensors(
+        qweight=qweight,
+        scale=scale,
+        bias=bias,
+        in_features=in_features,
+        out_features=out_features,
+        mode=internal_mode,
+        fp8_dtype=fp8_dtype,
+    )
+
+
+def _replace_quantized_modules_from_names(
+    model: torch.nn.Module,
+    module_names: list[str],
+    *,
+    mode: str,
+    state_dict: dict[str, torch.Tensor],
+) -> None:
+    for module_name in module_names:
+        module = model.get_submodule(module_name)
+        if not isinstance(module, torch.nn.Linear):
+            raise RuntimeError(f"量化缓存期望 Linear 模块 {module_name!r}，实际为 {type(module).__name__}。")
+        _replace_module(
+            model,
+            module_name,
+            _empty_quantized_linear_from_linear(
+                module,
+                mode,
+                has_bias=f"{module_name}.bias" in state_dict,
+            ),
+        )
+
+
+def _load_state_dict_assign(model: torch.nn.Module, state_dict: dict[str, torch.Tensor], *, strict: bool):
+    try:
+        return model.load_state_dict(state_dict, strict=strict, assign=True)
+    except TypeError:
+        return model.load_state_dict(state_dict, strict=strict)
+
+
+def _load_safetensors_into_module(module: torch.nn.Module, path: Path, *, strict: bool = True) -> None:
+    expected_keys = set(module.state_dict().keys())
+    loaded_keys: set[str] = set()
+    with _PlainSafetensorsReader(path) as reader:
+        for key in reader.keys():
+            _check_interrupted()
+            if key not in expected_keys:
+                continue
+            tensor = reader.get_tensor(key, clone=True)
+            _set_module_tensor(module, key, tensor)
+            loaded_keys.add(key)
+
+    if strict:
+        missing = expected_keys - loaded_keys
+        if missing:
+            sample = ", ".join(sorted(missing)[:5])
+            raise RuntimeError(f"分块加载 safetensors 缺少 {len(missing)} 个 tensor，示例: {sample}")
+
+
+def _replace_linear_modules(
+    module: torch.nn.Module,
+    quantization: str,
+    *,
+    module_names: Optional[list[str]] = None,
+    prefix: str = "",
+) -> int:
+    mode = _normalize_quantization_mode(quantization)
+    if mode is None:
         return 0
     count = 0
     for name, child in list(module.named_children()):
+        full_name = f"{prefix}.{name}" if prefix else name
         if isinstance(child, torch.nn.Linear):
             setattr(module, name, QuantizedLinear.from_linear(child, mode))
+            if module_names is not None:
+                module_names.append(full_name)
             count += 1
         else:
-            count += _replace_linear_modules(child, mode)
+            count += _replace_linear_modules(child, mode, module_names=module_names, prefix=full_name)
     return count
+
+
+def _load_lance_checkpoint_streaming_quantized(
+    model: torch.nn.Module,
+    model_path: Path,
+    quantization: str,
+) -> tuple[int, list[str]]:
+    mode = _normalize_quantization_mode(quantization)
+    if mode is None:
+        raise ValueError("分块量化加载需要启用量化模式。")
+
+    checkpoint_path = _checkpoint_file(model_path)
+    expected_keys = set(model.state_dict().keys())
+    loaded_keys: set[str] = set()
+    quantized_module_names: list[str] = []
+    start_time = time.monotonic()
+    last_report = start_time
+
+    print(f"[ComfyUI-Lance] 分块读取并量化 checkpoint: {checkpoint_path}", flush=True)
+    with _PlainSafetensorsReader(checkpoint_path) as shard:
+        keys = shard.keys()
+        total = len(keys)
+        for index, key in enumerate(keys, start=1):
+            _check_interrupted()
+            if key == "latent_pos_embed.pos_embed" or key not in expected_keys:
+                continue
+
+            module_name, attr_name = _split_tensor_name(key)
+            module = model.get_submodule(module_name) if module_name else model
+            tensor = shard.get_tensor(key, clone=not (attr_name == "weight" and isinstance(module, torch.nn.Linear)))
+
+            if attr_name == "weight" and isinstance(module, torch.nn.Linear):
+                qweight, scale, internal_mode, fp8_dtype = _quantize_weight_tensor(tensor, mode)
+                bias = None
+                if module.bias is not None:
+                    bias = module.bias.detach()
+                    if bias.is_floating_point():
+                        bias = bias.to(dtype=torch.float32).cpu()
+                    else:
+                        bias = bias.cpu()
+                _replace_module(
+                    model,
+                    module_name,
+                    QuantizedLinear.from_quantized_tensors(
+                        qweight=qweight,
+                        scale=scale,
+                        bias=bias,
+                        in_features=module.in_features,
+                        out_features=module.out_features,
+                        mode=internal_mode,
+                        fp8_dtype=fp8_dtype,
+                    ),
+                )
+                quantized_module_names.append(module_name)
+            else:
+                tensor = tensor.detach().cpu()
+                _set_module_tensor(model, key, tensor)
+
+            loaded_keys.add(key)
+            now = time.monotonic()
+            if now - last_report >= 5.0:
+                print(
+                    f"[ComfyUI-Lance] 分块量化进度 {index}/{total}，已量化 {len(quantized_module_names)} 个 Linear。",
+                    flush=True,
+                )
+                last_report = now
+            del tensor
+
+    gc.collect()
+    print(
+        f"[ComfyUI-Lance] 分块量化 checkpoint 完成，用时 {time.monotonic() - start_time:.2f}s: "
+        f"{len(quantized_module_names)} 个 Linear。",
+        flush=True,
+    )
+    return len(quantized_module_names), quantized_module_names
 
 
 @dataclass
@@ -503,6 +942,8 @@ class LanceModelHandle:
         dtype: torch.dtype,
         attention_backend: str,
         quantization: str,
+        quantization_cache_dir: Optional[Path],
+        rebuild_quantization_cache: bool,
         use_kv_cache: bool,
         download_missing: bool,
         download_source: str,
@@ -515,6 +956,8 @@ class LanceModelHandle:
         self.dtype = dtype
         self.attention_backend = attention_backend
         self.quantization = quantization
+        self.quantization_cache_dir = quantization_cache_dir
+        self.rebuild_quantization_cache = bool(rebuild_quantization_cache)
         self.use_kv_cache = bool(use_kv_cache)
         self.download_missing = bool(download_missing)
         self.download_source = download_source
@@ -528,6 +971,8 @@ class LanceModelHandle:
             str(self.dtype),
             self.attention_backend,
             self.quantization,
+            str(self.quantization_cache_dir.resolve()) if self.quantization_cache_dir else None,
+            self.rebuild_quantization_cache,
             self.use_kv_cache,
             self.revision,
         )
@@ -570,7 +1015,6 @@ class LanceModelHandle:
         _patch_lance_device(self.device)
         _configure_attention_backend(self.attention_backend)
 
-        from safetensors.torch import load_file
         from transformers import set_seed
         from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLVisionConfig
 
@@ -585,6 +1029,17 @@ class LanceModelHandle:
         from modeling.vit.qwen2_5_vl_vit import Qwen2_5_VisionTransformerPretrainedModel
 
         model_path = self.paths.image_model if family == "image" else self.paths.video_model
+        quantization_mode = _normalize_quantization_mode(self.quantization)
+        cache_path: Optional[Path] = None
+        expected_cache_metadata: Optional[dict[str, Any]] = None
+        if quantization_mode is not None and self.quantization_cache_dir is not None:
+            cache_path, expected_cache_metadata = _quantization_cache_path(
+                self.quantization_cache_dir,
+                model_path,
+                self.paths.vit,
+                quantization_mode,
+            )
+
         model_args = ModelArguments(
             model_path=str(model_path),
             llm_path=str(model_path),
@@ -613,10 +1068,15 @@ class LanceModelHandle:
         vit_config = Qwen2_5_VLVisionConfig.from_pretrained(str(self.paths.vit))
         _set_attention_impl(vit_config, _vit_attention_impl(self.attention_backend))
         vit_model = Qwen2_5_VisionTransformerPretrainedModel(vit_config)
-        vit_weights = load_file(str(self.paths.vit / "vit.safetensors"))
-        vit_model.load_state_dict(vit_weights, strict=True)
-        clean_memory(vit_weights)
-        _check_interrupted()
+        vit_weights_loaded = False
+
+        def load_vit_weights_if_needed() -> None:
+            nonlocal vit_weights_loaded
+            if vit_weights_loaded:
+                return
+            _load_safetensors_into_module(vit_model, self.paths.vit / "vit.safetensors", strict=True)
+            vit_weights_loaded = True
+            _check_interrupted()
 
         vae_config = AutoEncoderParams(
             downsample_spatial=16,
@@ -650,37 +1110,132 @@ class LanceModelHandle:
         tokenizer: Qwen2Tokenizer = Qwen2Tokenizer.from_pretrained(str(model_path))
         tokenizer, new_token_ids, num_new_tokens = add_special_tokens(tokenizer)
 
-        if inference_args.copy_init_moe:
-            language_model.init_moe()
+        def apply_tokenizer_shape_and_ties() -> int:
+            nonlocal language_model
+            if num_new_tokens > 0:
+                model.language_model.resize_token_embeddings(len(tokenizer))
+                model.config.llm_config.vocab_size = len(tokenizer)
+                model.language_model.config.vocab_size = len(tokenizer)
 
-        init_from_model_path_if_needed(model, model_args)
+            if model_args.vit_type.lower() == "qwen2_5_vl":
+                from common.model.hacks import hack_qwen2_5_vl_config
 
-        if num_new_tokens > 0:
-            model.language_model.resize_token_embeddings(len(tokenizer))
-            model.config.llm_config.vocab_size = len(tokenizer)
-            model.language_model.config.vocab_size = len(tokenizer)
+                language_model = hack_qwen2_5_vl_config(language_model)
 
-        if model_args.vit_type.lower() == "qwen2_5_vl":
-            from common.model.hacks import hack_qwen2_5_vl_config
+            image_id = language_model.config.video_token_id
+            new_token_ids.update({"image_token_id": image_id})
+            model.update_tokenizer(tokenizer=tokenizer)
 
-            language_model = hack_qwen2_5_vl_config(language_model)
+            if model_args.tie_word_embeddings:
+                output_embeddings = model.language_model.get_output_embeddings()
+                if isinstance(output_embeddings, QuantizedLinear):
+                    if num_new_tokens > 0:
+                        raise RuntimeError("量化 lm_head 不支持在新增 tokenizer token 后执行 tie_word_embeddings 解绑。")
+                    print("[ComfyUI-Lance] lm_head 已量化，跳过 tie_word_embeddings 解绑。", flush=True)
+                else:
+                    model.language_model.untie_lm_head()
+                    model.language_model.copy_new_token_rows_to_lm_head(num_new_tokens)
+                model_args.tie_word_embeddings = False
+                llm_config.tie_word_embeddings = False
+            else:
+                assert (
+                    not _embeddings_share_plain_weight(
+                        model.language_model.get_input_embeddings(),
+                        model.language_model.get_output_embeddings(),
+                    )
+                ), "tie_word_embeddings conflict"
+            return image_id
 
-        image_token_id = language_model.config.video_token_id
-        new_token_ids.update({"image_token_id": image_token_id})
-        model.update_tokenizer(tokenizer=tokenizer)
+        loaded_quantized_cache = False
+        quantized_count = 0
+        image_token_id = -1
+        if cache_path is not None and expected_cache_metadata is not None and cache_path.exists() and not self.rebuild_quantization_cache:
+            cache_applied_structural_changes = False
+            try:
+                cache_start = time.monotonic()
+                print(f"[ComfyUI-Lance] 正在加载量化缓存: {cache_path}", flush=True)
+                payload = _torch_load_weights(cache_path, map_location="cpu")
+                if payload.get("metadata") != expected_cache_metadata:
+                    raise RuntimeError("量化缓存元数据与当前模型文件不匹配")
+                state_dict = payload["state_dict"]
+                quantized_module_names = list(payload["quantized_module_names"])
+                image_token_id = apply_tokenizer_shape_and_ties()
+                cache_applied_structural_changes = True
+                _replace_quantized_modules_from_names(
+                    model,
+                    quantized_module_names,
+                    mode=quantization_mode or self.quantization,
+                    state_dict=state_dict,
+                )
+                _load_state_dict_assign(model, state_dict, strict=True)
+                clean_memory(state_dict, payload)
+                quantized_count = len(quantized_module_names)
+                loaded_quantized_cache = True
+                print(
+                    f"[ComfyUI-Lance] 量化缓存加载完成，用时 {time.monotonic() - cache_start:.2f}s: "
+                    f"{quantized_count} 个 Linear。",
+                    flush=True,
+                )
+            except Exception as exc:
+                if cache_applied_structural_changes:
+                    raise RuntimeError(
+                        "Lance 量化缓存通过元数据检查，但加载到模型结构时失败；请打开“重建量化缓存”刷新缓存。"
+                    ) from exc
+                print(f"[ComfyUI-Lance] 无法使用量化缓存（{exc}），改为从原始权重重建。", flush=True)
 
-        if model_args.tie_word_embeddings:
-            model.language_model.untie_lm_head()
-            model.language_model.copy_new_token_rows_to_lm_head(num_new_tokens)
-            model_args.tie_word_embeddings = False
-            llm_config.tie_word_embeddings = False
-        else:
-            assert (
-                model.language_model.get_input_embeddings().weight.data.data_ptr()
-                != model.language_model.get_output_embeddings().weight.data.data_ptr()
-            ), "tie_word_embeddings conflict"
+        if not loaded_quantized_cache:
+            load_vit_weights_if_needed()
 
-        quantized_count = _replace_linear_modules(model, self.quantization)
+            if quantization_mode is not None:
+                if inference_args.copy_init_moe:
+                    language_model.init_moe()
+
+                quantized_count, quantized_module_names = _load_lance_checkpoint_streaming_quantized(
+                    model,
+                    model_path,
+                    self.quantization,
+                )
+                remaining_count = _replace_linear_modules(
+                    model,
+                    self.quantization,
+                    module_names=quantized_module_names,
+                )
+                if remaining_count:
+                    quantized_count += remaining_count
+                    print(
+                        f"[ComfyUI-Lance] 已量化 checkpoint 外剩余 Linear: {remaining_count} 个。",
+                        flush=True,
+                    )
+            else:
+                if inference_args.copy_init_moe:
+                    language_model.init_moe()
+
+                init_from_model_path_if_needed(model, model_args)
+                quantized_module_names = []
+                quantized_count = 0
+
+            image_token_id = apply_tokenizer_shape_and_ties()
+            if cache_path is not None and expected_cache_metadata is not None and quantized_count:
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    cache_start = time.monotonic()
+                    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+                    torch.save(
+                        {
+                            "metadata": expected_cache_metadata,
+                            "quantized_module_names": quantized_module_names,
+                            "state_dict": model.state_dict(),
+                        },
+                        str(tmp_path),
+                    )
+                    os.replace(tmp_path, cache_path)
+                    print(
+                        f"[ComfyUI-Lance] 已保存量化缓存，用时 {time.monotonic() - cache_start:.2f}s: {cache_path}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(f"[ComfyUI-Lance] 警告：保存量化缓存失败: {exc}", flush=True)
+
         if quantized_count:
             print(f"[ComfyUI-Lance] {self.quantization} quantized Linear layers: {quantized_count}")
 
@@ -1022,6 +1577,18 @@ class LanceLoadModel:
                     ["none", "int8", "int4", "fp8_e4m3fn", "fp8_e5m2"],
                     _ui("量化加载", "对 Linear 权重做轻量量化包装；none 为原始精度。", default="none"),
                 ),
+                "use_quantization_cache": (
+                    "BOOLEAN",
+                    _ui(
+                        "量化缓存",
+                        "启用后将可复用量化权重保存到 ComfyUI/models/Lance-quantized-cache。",
+                        default=True,
+                    ),
+                ),
+                "rebuild_quantization_cache": (
+                    "BOOLEAN",
+                    _ui("重建量化缓存", "忽略已有量化缓存并重新从原始权重量化生成。", default=False),
+                ),
                 "use_kv_cache": (
                     "BOOLEAN",
                     _ui("KV Cache", "生成视觉内容时启用 Lance 的 KV cache 路径；实验选项。", default=False),
@@ -1051,7 +1618,9 @@ class LanceLoadModel:
         compute_dtype: str,
         attention_backend: str,
         quantization: str,
-        use_kv_cache: bool,
+        use_quantization_cache: bool = True,
+        rebuild_quantization_cache: bool = False,
+        use_kv_cache: bool = False,
         download_missing: bool = False,
         download_source: str = "huggingface.co",
         revision: str = "",
@@ -1059,6 +1628,8 @@ class LanceLoadModel:
         model_root_path = _resolve_model_root(model_root)
         paths = _lance_paths(model_root_path)
         device_obj, device_index = _resolve_device(device)
+        quantization_mode = _normalize_quantization_mode(quantization)
+        quantization_cache_dir = _lance_quantization_cache_dir() if use_quantization_cache and quantization_mode else None
         handle = LanceModelHandle(
             model_root=model_root_path,
             paths=paths,
@@ -1067,13 +1638,16 @@ class LanceLoadModel:
             dtype=_dtype_from_name(compute_dtype),
             attention_backend=attention_backend,
             quantization=quantization,
+            quantization_cache_dir=quantization_cache_dir,
+            rebuild_quantization_cache=rebuild_quantization_cache,
             use_kv_cache=use_kv_cache,
             download_missing=download_missing,
             download_source=download_source,
             revision=revision or "",
         )
         status = handle.preload(model_scope)
-        return (handle, f"{status}\n模型根目录: {model_root_path}\n设备: {device_obj}")
+        cache_status = f"\n量化缓存目录: {quantization_cache_dir}" if quantization_cache_dir is not None else ""
+        return (handle, f"{status}\n模型根目录: {model_root_path}\n设备: {device_obj}{cache_status}")
 
 
 class LanceImageUnderstanding:
