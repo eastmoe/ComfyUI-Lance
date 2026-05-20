@@ -527,6 +527,65 @@ def _torch_load_weights(path: Path, map_location: str | torch.device):
         return torch.load(str(path), map_location=map_location)
 
 
+def _expected_quantized_linear_shapes(
+    linear: torch.nn.Linear,
+    mode: str,
+    *,
+    has_bias: bool,
+) -> dict[str, tuple[int, ...]]:
+    out_features = int(linear.out_features)
+    in_features = int(linear.in_features)
+    mode = mode.lower()
+    if mode in {"int8", "fp8_e4m3fn", "fp8_e5m2", "fp8"}:
+        qweight_shape = (out_features, in_features)
+    elif mode == "int4":
+        qweight_shape = (out_features, (in_features + 1) // 2)
+    else:
+        raise ValueError(f"不支持的量化格式: {mode}")
+
+    shapes = {"qweight": qweight_shape}
+    if mode in {"int8", "int4"}:
+        shapes["scale"] = (out_features,)
+    if has_bias:
+        shapes["bias"] = (out_features,)
+    return shapes
+
+
+def _validate_quantized_cache_for_model(
+    model: torch.nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    quantized_module_names: list[str],
+    *,
+    mode: str,
+) -> None:
+    expected_shapes: dict[str, tuple[int, ...]] = {}
+    for module_name in quantized_module_names:
+        module = model.get_submodule(module_name)
+        if not isinstance(module, torch.nn.Linear):
+            raise RuntimeError(f"量化缓存期望 Linear 模块 {module_name!r}，实际为 {type(module).__name__}。")
+
+        quantized_shapes = _expected_quantized_linear_shapes(
+            module,
+            mode,
+            has_bias=f"{module_name}.bias" in state_dict,
+        )
+        for attr_name, shape in quantized_shapes.items():
+            expected_shapes[f"{module_name}.{attr_name}"] = shape
+
+    mismatches = []
+    for key, expected_shape in expected_shapes.items():
+        if key not in state_dict:
+            mismatches.append(f"{key}: 缓存缺失，当前需要 {expected_shape}")
+            continue
+        actual_shape = tuple(state_dict[key].shape)
+        if actual_shape != expected_shape:
+            mismatches.append(f"{key}: 缓存 {actual_shape} != 当前 {expected_shape}")
+        if len(mismatches) >= 5:
+            break
+    if mismatches:
+        raise RuntimeError("量化缓存 tensor shape 与当前模型结构不匹配: " + "；".join(mismatches))
+
+
 def _split_tensor_name(name: str) -> tuple[str, str]:
     if "." not in name:
         return "", name
@@ -736,22 +795,23 @@ def _empty_quantized_linear_from_linear(
     in_features = linear.in_features
     mode = mode.lower()
     fp8_dtype = None
+    qweight_shape = _expected_quantized_linear_shapes(linear, mode, has_bias=has_bias)["qweight"]
     if mode == "int8":
-        qweight = torch.empty((out_features, in_features), dtype=torch.int8, device="meta")
+        qweight = torch.empty(qweight_shape, dtype=torch.int8, device="meta")
         scale = torch.empty((out_features,), dtype=torch.float32, device="meta")
         internal_mode = "int8"
     elif mode == "int4":
-        qweight = torch.empty((out_features, (in_features + 1) // 2), dtype=torch.uint8, device="meta")
+        qweight = torch.empty(qweight_shape, dtype=torch.uint8, device="meta")
         scale = torch.empty((out_features,), dtype=torch.float32, device="meta")
         internal_mode = "int4"
     elif mode in {"fp8_e4m3fn", "fp8"}:
         fp8_dtype = getattr(torch, "float8_e4m3fn", torch.uint8)
-        qweight = torch.empty((out_features, in_features), dtype=fp8_dtype, device="meta")
+        qweight = torch.empty(qweight_shape, dtype=fp8_dtype, device="meta")
         scale = None
         internal_mode = "fp8"
     elif mode == "fp8_e5m2":
         fp8_dtype = getattr(torch, "float8_e5m2", torch.uint8)
-        qweight = torch.empty((out_features, in_features), dtype=fp8_dtype, device="meta")
+        qweight = torch.empty(qweight_shape, dtype=fp8_dtype, device="meta")
         scale = None
         internal_mode = "fp8"
     else:
@@ -870,6 +930,12 @@ def _load_lance_checkpoint_streaming_quantized(
             tensor = shard.get_tensor(key, clone=not (attr_name == "weight" and isinstance(module, torch.nn.Linear)))
 
             if attr_name == "weight" and isinstance(module, torch.nn.Linear):
+                expected_shape = (int(module.out_features), int(module.in_features))
+                if tuple(tensor.shape) != expected_shape:
+                    raise RuntimeError(
+                        f"checkpoint 中 {key} 的 shape={tuple(tensor.shape)} 与当前模型结构 {expected_shape} 不一致；"
+                        "请检查 Lance latent_patch_size/模型版本是否匹配。"
+                    )
                 qweight, scale, internal_mode, fp8_dtype = _quantize_weight_tensor(tensor, mode)
                 bias = None
                 if module.bias is not None:
@@ -1044,6 +1110,7 @@ class LanceModelHandle:
             model_path=str(model_path),
             llm_path=str(model_path),
             vit_path=str(self.paths.vit),
+            latent_patch_size=[1, 1, 1],
         )
 
         inference_args = InferenceArguments(
@@ -1151,6 +1218,8 @@ class LanceModelHandle:
         image_token_id = -1
         if cache_path is not None and expected_cache_metadata is not None and cache_path.exists() and not self.rebuild_quantization_cache:
             cache_applied_structural_changes = False
+            payload = None
+            state_dict = None
             try:
                 cache_start = time.monotonic()
                 print(f"[ComfyUI-Lance] 正在加载量化缓存: {cache_path}", flush=True)
@@ -1159,6 +1228,12 @@ class LanceModelHandle:
                     raise RuntimeError("量化缓存元数据与当前模型文件不匹配")
                 state_dict = payload["state_dict"]
                 quantized_module_names = list(payload["quantized_module_names"])
+                _validate_quantized_cache_for_model(
+                    model,
+                    state_dict,
+                    quantized_module_names,
+                    mode=quantization_mode or self.quantization,
+                )
                 image_token_id = apply_tokenizer_shape_and_ties()
                 cache_applied_structural_changes = True
                 _replace_quantized_modules_from_names(
@@ -1181,6 +1256,7 @@ class LanceModelHandle:
                     raise RuntimeError(
                         "Lance 量化缓存通过元数据检查，但加载到模型结构时失败；请打开“重建量化缓存”刷新缓存。"
                     ) from exc
+                clean_memory(state_dict, payload)
                 print(f"[ComfyUI-Lance] 无法使用量化缓存（{exc}），改为从原始权重重建。", flush=True)
 
         if not loaded_quantized_cache:

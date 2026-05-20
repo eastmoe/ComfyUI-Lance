@@ -56,11 +56,11 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     out: (M, D)
     """
     assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega = np.arange(embed_dim // 2, dtype=np.float32)
     omega /= embed_dim / 2.
     omega = 1. / 10000**omega  # (D/2,)
 
-    pos = pos.reshape(-1)  # (M,)
+    pos = pos.reshape(-1).astype(np.float32, copy=False)  # (M,)
     out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
 
     emb_sin = np.sin(out) # (M, D/2)
