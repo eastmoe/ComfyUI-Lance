@@ -61,6 +61,22 @@ from transformers.utils import (
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 
 
+def _compute_default_rope_parameters(config=None, device=None, seq_len=None, **rope_kwargs):
+    if config is not None:
+        base = config.rope_theta
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        dim = int(head_dim * partial_rotary_factor)
+    else:
+        base = rope_kwargs["base"]
+        dim = rope_kwargs["dim"]
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64, device=device).float() / dim))
+    return inv_freq, 1.0
+
+
+ROPE_INIT_FUNCTIONS.setdefault("default", _compute_default_rope_parameters)
+
+
 if is_flash_attn_2_available():
     try:
         from flash_attn import flash_attn_varlen_func

@@ -362,10 +362,16 @@ def _vit_attention_impl(attention_backend: str) -> str:
 
 
 def _llm_attention_impl(attention_backend: str) -> str:
-    backend = (attention_backend or "auto").strip().lower()
-    if backend == "flash_attention_2":
-        return "flash_attention_2"
-    return "flash_attention_2"
+    # Navit uses its own packed attention path; keep Transformers init from
+    # rejecting this custom architecture during backend validation.
+    return "eager"
+
+
+def _set_attention_impl(config: Any, implementation: str) -> None:
+    config._attn_implementation = implementation
+    # Newer Transformers versions keep the requested backend in this internal
+    # field and validate it during PreTrainedModel.__init__.
+    config._attn_implementation_internal = implementation
 
 
 class QuantizedLinear(torch.nn.Module):
@@ -600,12 +606,12 @@ class LanceModelHandle:
         llm_config.tie_word_embeddings = model_args.tie_word_embeddings
         llm_config.freeze_und = False
         llm_config.apply_qwen_2_5_vl_pos_emb = inference_args.apply_qwen_2_5_vl_pos_emb
-        llm_config._attn_implementation = _llm_attention_impl(self.attention_backend)
+        _set_attention_impl(llm_config, _llm_attention_impl(self.attention_backend))
 
         language_model: Qwen2ForCausalLM = Qwen2ForCausalLM(llm_config)
 
         vit_config = Qwen2_5_VLVisionConfig.from_pretrained(str(self.paths.vit))
-        vit_config._attn_implementation = _vit_attention_impl(self.attention_backend)
+        _set_attention_impl(vit_config, _vit_attention_impl(self.attention_backend))
         vit_model = Qwen2_5_VisionTransformerPretrainedModel(vit_config)
         vit_weights = load_file(str(self.paths.vit / "vit.safetensors"))
         vit_model.load_state_dict(vit_weights, strict=True)

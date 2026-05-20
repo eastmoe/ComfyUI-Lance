@@ -180,6 +180,9 @@ class _Qwen2Config(PretrainedConfig):
         self.is_causal = is_causal
         self._attn_implementation = _attn_implementation
 
+        if kwargs.get("pad_token_id") is None:
+            kwargs["pad_token_id"] = kwargs.get("bos_token_id", 151643)
+
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:
