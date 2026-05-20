@@ -45,7 +45,12 @@ from .configuration_qwen2 import Qwen2Config
 
 
 if is_flash_attn_2_available():
-    from transformers.modeling_flash_attention_utils import _flash_attention_forward
+    try:
+        from transformers.modeling_flash_attention_utils import _flash_attention_forward
+    except Exception:
+        _flash_attention_forward = None
+else:
+    _flash_attention_forward = None
 
 
 logger = logging.get_logger(__name__)
@@ -456,7 +461,7 @@ class Qwen2FlashAttention2(Qwen2Attention):
 
 QWEN2_ATTENTION_CLASSES = {
     "eager": Qwen2Attention,
-    "flash_attention_2": Qwen2FlashAttention2,
+    "flash_attention_2": Qwen2FlashAttention2 if _flash_attention_forward is not None else Qwen2Attention,
 }
 
 
@@ -678,6 +683,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
     def __init__(self, config: Qwen2Config):
         super().__init__(config)
+        if config._attn_implementation == "flash_attention_2" and _flash_attention_forward is None:
+            config._attn_implementation = "eager"
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 

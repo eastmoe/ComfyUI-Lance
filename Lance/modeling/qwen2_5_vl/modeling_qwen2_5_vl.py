@@ -62,18 +62,18 @@ from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 
 
 if is_flash_attn_2_available():
-    from flash_attn import flash_attn_varlen_func
-    from flash_attn.layers.rotary import apply_rotary_emb
-
+    try:
+        from flash_attn import flash_attn_varlen_func
+        from flash_attn.layers.rotary import apply_rotary_emb
+        from transformers.modeling_flash_attention_utils import _flash_attention_forward
+    except Exception:
+        flash_attn_varlen_func = None
+        apply_rotary_emb = None
+        _flash_attention_forward = None
 else:
     flash_attn_varlen_func = None
     apply_rotary_emb = None
-
-
-if is_flash_attn_2_available():
-    from transformers.modeling_flash_attention_utils import _flash_attention_forward
-else:
-    flash_attn_varlen_func = None
+    _flash_attention_forward = None
 
 
 logger = logging.get_logger(__name__)
@@ -335,7 +335,7 @@ class Qwen2_5_VLVisionSdpaAttention(nn.Module):
 
 QWEN2_5_VL_VISION_ATTENTION_CLASSES = {
     "eager": Qwen2_5_VLVisionAttention,
-    "flash_attention_2": Qwen2_5_VLVisionFlashAttention2,
+    "flash_attention_2": Qwen2_5_VLVisionFlashAttention2 if flash_attn_varlen_func is not None else Qwen2_5_VLVisionSdpaAttention,
     "sdpa": Qwen2_5_VLVisionSdpaAttention,
 }
 
@@ -1022,7 +1022,7 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
 
 QWEN2_5_VL_ATTENTION_CLASSES = {
     "eager": Qwen2_5_VLAttention,
-    "flash_attention_2": Qwen2_5_VLFlashAttention2,
+    "flash_attention_2": Qwen2_5_VLFlashAttention2 if _flash_attention_forward is not None else Qwen2_5_VLSdpaAttention,
     "sdpa": Qwen2_5_VLSdpaAttention,
 }
 
@@ -1118,6 +1118,8 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
 class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
     def __init__(self, config: Qwen2_5_VLConfig):
         super().__init__(config)
+        if config._attn_implementation == "flash_attention_2" and _flash_attention_forward is None:
+            config._attn_implementation = "sdpa"
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 

@@ -50,9 +50,12 @@ from transformers.utils import is_flash_attn_2_available
 from transformers.activations import ACT2FN
 
 if is_flash_attn_2_available():
-    from flash_attn import flash_attn_varlen_func
-    from flash_attn.layers.rotary import apply_rotary_emb
-
+    try:
+        from flash_attn import flash_attn_varlen_func
+        from flash_attn.layers.rotary import apply_rotary_emb
+    except Exception:
+        flash_attn_varlen_func = None
+        apply_rotary_emb = None
 else:
     flash_attn_varlen_func = None
     apply_rotary_emb = None
@@ -218,7 +221,7 @@ class Qwen2_5_VLVisionSdpaAttention(nn.Module):
 
 QWEN2_5_VL_VISION_ATTENTION_CLASSES = {
     "eager": Qwen2_5_VLVisionAttention,
-    "flash_attention_2": Qwen2_5_VLVisionFlashAttention2,
+    "flash_attention_2": Qwen2_5_VLVisionFlashAttention2 if flash_attn_varlen_func is not None else Qwen2_5_VLVisionSdpaAttention,
     "sdpa": Qwen2_5_VLVisionSdpaAttention,
 }
 

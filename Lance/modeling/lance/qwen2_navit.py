@@ -27,7 +27,10 @@ from torch.nn.attention.flex_attention import flex_attention
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.utils import ModelOutput
 
-from flash_attn import flash_attn_varlen_func
+try:
+    from flash_attn import flash_attn_varlen_func
+except Exception:
+    flash_attn_varlen_func = None
 from modeling.qwen2.modeling_qwen2 import (
     Qwen2Attention,
     Qwen2MLP,
@@ -45,6 +48,65 @@ from modeling.qwen2.configuration_qwen2 import Qwen2Config
 torch._dynamo.config.cache_size_limit = 512
 torch._dynamo.config.accumulated_cache_size_limit = 4096
 flex_attention = torch.compile(flex_attention)
+
+
+def flash_attn_varlen_or_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    causal: bool = False,
+) -> torch.Tensor:
+    if flash_attn_varlen_func is not None:
+        return flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            causal=causal,
+        )
+
+    outputs = []
+    cu_seqlens_q = cu_seqlens_q.to(torch.long)
+    cu_seqlens_k = cu_seqlens_k.to(torch.long)
+    num_heads = q.shape[1]
+    num_key_value_heads = k.shape[1]
+    num_key_value_groups = num_heads // num_key_value_heads
+
+    for i in range(cu_seqlens_q.numel() - 1):
+        query_states = q[cu_seqlens_q[i] : cu_seqlens_q[i + 1]].transpose(0, 1).unsqueeze(0)
+        key_states = k[cu_seqlens_k[i] : cu_seqlens_k[i + 1]].transpose(0, 1).unsqueeze(0)
+        value_states = v[cu_seqlens_k[i] : cu_seqlens_k[i + 1]].transpose(0, 1).unsqueeze(0)
+
+        if num_key_value_groups != 1:
+            key_states = key_states.repeat_interleave(num_key_value_groups, dim=1)
+            value_states = value_states.repeat_interleave(num_key_value_groups, dim=1)
+
+        attn_mask = None
+        if causal:
+            query_len = query_states.shape[-2]
+            key_len = key_states.shape[-2]
+            past_len = key_len - query_len
+            query_positions = torch.arange(query_len, device=q.device) + past_len
+            key_positions = torch.arange(key_len, device=q.device)
+            attn_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+
+        attn_output = scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+        )
+        outputs.append(attn_output.squeeze(0).transpose(0, 1))
+
+    return torch.cat(outputs, dim=0)
 
 class NaiveCache:
     def __init__(self, num_layers):
@@ -206,7 +268,7 @@ class PackedAttention(Qwen2Attention):
         cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0))
         cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(key_values_lens, dim=0), (1, 0))
 
-        packed_attn_output = flash_attn_varlen_func(
+        packed_attn_output = flash_attn_varlen_or_sdpa(
             q=packed_query_states,
             k=merged_key_states,
             v=merged_value_states,
@@ -460,7 +522,7 @@ class PackedAttentionMoT(Qwen2Attention):
         cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0))
         cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(key_values_lens, dim=0), (1, 0))
 
-        packed_attn_output = flash_attn_varlen_func(
+        packed_attn_output = flash_attn_varlen_or_sdpa(
             q=packed_query_states,
             k=merged_key_states,
             v=merged_value_states,
