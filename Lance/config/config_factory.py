@@ -166,7 +166,7 @@ class DataArguments:
 class InferenceArguments:
     # Runtime switches.
     apply_chat_template:        bool = False  # 是否对输入文本套用 Qwen2.5-VL chat template
-    apply_qwen_2_5_vl_pos_emb:  bool = False  # 是否启用 Qwen2.5-VL position embedding
+    apply_qwen_2_5_vl_pos_emb:  bool = True  # 是否启用 Qwen2.5-VL position embedding
 
     visual_gen:                 bool = True
     visual_und:                 bool = True
@@ -198,11 +198,11 @@ class InferenceArguments:
     num_frames:                 int = 50
     task:                       str = "t2v"
     resolution:                 str = "video_360p"  # image_256res, image_512res, video_192p, video_360p 等
-    text_template:              bool = False  # 是否使用 system_prompt 文本模板
+    text_template:              bool = True  # 是否使用 system_prompt 文本模板
     max_duration:               float = 6.0  # 最大视频时长（秒）
 
     system_prompt_type:         str = "SP0"  # options: SP1, SP2 ...
-    use_KVcache:                bool = False
+    use_KVcache:                bool = True
 
     # Direct demo inputs. If input_json is supplied, these are ignored.
     prompt:                     str = ""

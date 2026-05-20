@@ -1256,6 +1256,8 @@ class LanceModelHandle:
         inference_args = InferenceArguments(
             visual_gen=True,
             visual_und=True,
+            text_template=True,
+            apply_qwen_2_5_vl_pos_emb=True,
             use_KVcache=self.use_kv_cache,
         )
         set_seed(inference_args.global_seed)
@@ -1581,6 +1583,8 @@ class LanceModelHandle:
             max_samples=1,
             visual_gen=True,
             visual_und=True,
+            text_template=True,
+            apply_qwen_2_5_vl_pos_emb=True,
         )
         if resolution and resolution != "auto":
             inference_args.resolution = resolution
@@ -1875,7 +1879,7 @@ class LanceLoadModel:
                 ),
                 "use_kv_cache": (
                     "BOOLEAN",
-                    _ui("KV Cache", "生成视觉内容时启用 Lance 的 KV cache 路径；实验选项。", default=False),
+                    _ui("启用 KV Cache", "生成视觉内容时启用 Lance 官方 KV cache 路径；可降低重复注意力计算。", default=True),
                 ),
             },
             "optional": {
@@ -1904,7 +1908,7 @@ class LanceLoadModel:
         quantization: str,
         use_quantization_cache: bool = True,
         rebuild_quantization_cache: bool = False,
-        use_kv_cache: bool = False,
+        use_kv_cache: bool = True,
         download_missing: bool = False,
         download_source: str = "huggingface.co",
         revision: str = "",
@@ -1931,7 +1935,8 @@ class LanceLoadModel:
         )
         status = handle.preload(model_scope)
         cache_status = f"\n量化缓存目录: {quantization_cache_dir}" if quantization_cache_dir is not None else ""
-        return (handle, f"{status}\n模型根目录: {model_root_path}\n设备: {device_obj}{cache_status}")
+        kv_cache_status = "开启" if use_kv_cache else "关闭"
+        return (handle, f"{status}\n模型根目录: {model_root_path}\n设备: {device_obj}\nKV Cache: {kv_cache_status}{cache_status}")
 
 
 class LanceImageUnderstanding:
