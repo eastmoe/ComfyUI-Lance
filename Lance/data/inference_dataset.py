@@ -1195,7 +1195,7 @@ class InferenceDataset(Dataset):
                 )
                 sample_lens += curr_split_len
                 sample_modality.extend([modality_map["ref_vit"]] * curr_split_len)
-                index_video_path_name = element.split("/")[-1]
+                index_video_path_name = os.path.basename(element)
 
                 if self.data_config.text_template:
                     text_template_user.append({"type": element_dtype})

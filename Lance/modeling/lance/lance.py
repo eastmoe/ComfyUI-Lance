@@ -42,6 +42,16 @@ from common.inference_utils import map_splits_to_samples, make_packed_vit_token_
 from data.common import shift_position_ids
 from copy import deepcopy
 
+
+def _check_inference_interrupted():
+    try:
+        from comfy import model_management
+
+        model_management.throw_exception_if_processing_interrupted()
+    except ImportError:
+        return
+
+
 class LanceConfig(PretrainedConfig):
     def __init__(
         self,
@@ -449,6 +459,7 @@ class Lance(PreTrainedModel):
         padded_videos = []
         # self.logger.info(f"Validation start... (timesteps = {num_timesteps})")
         for i_sample in range(num_samples):
+            _check_inference_interrupted()
             left, right = sample_splits[i_sample][0], sample_splits[i_sample][-1] + 1
             # --- for interleave ---
             current_split_lens = val_split_lens[left:right]
@@ -644,6 +655,7 @@ class Lance(PreTrainedModel):
                 # for group-by-group generation
 
                 for i, timestep_ in enumerate(timesteps):
+                    _check_inference_interrupted()
                     timestep[current_vae_mse_indexes_local_in_vae] = torch.tensor([timestep_] * current_vae_mse_indexes_local_in_vae.shape[0], device=x_t.device)
                     if timestep_ > cfg_interval[0] and timestep_ <= cfg_interval[1]:
                         cfg_text_scale_ = cfg_text_scale
@@ -937,6 +949,7 @@ class Lance(PreTrainedModel):
         L = len(val_sample_lens)  # 与测试的时候兼容，不再-1
         curr_vit_split_idx = 0
         for i_sample in range(L):
+            _check_inference_interrupted()
             left, right = sample_splits[i_sample][0], sample_splits[i_sample][-1] + 1
             # --- for interleave ---
             current_split_lens = val_split_lens[left:right]
@@ -1034,6 +1047,7 @@ class Lance(PreTrainedModel):
             current_attn_modes_ = current_attn_modes[: len(current_split_lens)] + ["causal", "causal"]
             current_attn_modes_ = ["full" if mode_=="full_noise" else mode_ for mode_ in current_attn_modes_]
             while step < (max_seq_len - 1):
+                _check_inference_interrupted()
                 # current_sample_lens = [curr_packed_sequence.shape[0]]
                 # attention 的求解存在问题
 
@@ -1129,6 +1143,7 @@ class Lance(PreTrainedModel):
         # self.logger.info(f'val_attn_modes: {val_attn_modes}')
 
         for i_sample in range(L):
+            _check_inference_interrupted()
             left, right = 2 * i_sample, 2 * i_sample + 1
             # self.logger.info(f'left: {left}, right: {right}')
             if right >= len(val_attn_modes):   # ✅ 边界判断
@@ -1320,6 +1335,7 @@ class Lance(PreTrainedModel):
         generated_sequence = []
         curr_tokens = packed_start_tokens
         while step < max_length:
+            _check_inference_interrupted()
             generated_sequence.append(curr_tokens)
             packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
             query_lens = torch.ones_like(curr_tokens)
@@ -1459,6 +1475,7 @@ class Lance(PreTrainedModel):
         padded_videos = []
         # self.logger.info(f"Validation start... (timesteps = {num_timesteps})")
         for i_sample in range(L):  # fix: 需要-1
+            _check_inference_interrupted()
             left, right = sample_splits[i_sample][0], sample_splits[i_sample][-1] + 1
             # --- for interleave ---
             current_split_lens = val_split_lens[left:right]
@@ -1656,6 +1673,7 @@ class Lance(PreTrainedModel):
             self.language_model.eval()
             self.eval()
             for i_attn_mode_, current_cond_len in zip(current_attn_modes, current_split_lens):
+                _check_inference_interrupted()
                 current_cond_end += current_cond_len
                 if i_attn_mode_ == "noise": # 求解  noise latent 前 的 kv cache
                     vae_in_packed_sequence_index = torch.arange(current_cond_start, current_cond_end, dtype=torch.long, device=device) # vae split 在 packed_sequence 中的索引
@@ -1686,6 +1704,7 @@ class Lance(PreTrainedModel):
                 # for group-by-group generation
 
                 for i, timestep_ in enumerate(timesteps):
+                    _check_inference_interrupted()
 
                     timestep[current_vae_mse_indexes_local_in_vae] = torch.tensor([timestep_] * current_vae_mse_indexes_local_in_vae.shape[0], device=x_t.device)
                     if timestep_ > cfg_interval[0] and timestep_ <= cfg_interval[1]:

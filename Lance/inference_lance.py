@@ -427,9 +427,11 @@ def run_inference_batch(
     save_path_gt: str = "",
 ):
     batch = batch_cpu.cuda(device).to_dict()
-    fsdp_model = fsdp_model.to(device=device, dtype=torch.bfloat16)
+    runtime_dtype = getattr(inference_args, "runtime_dtype", torch.bfloat16)
+    fsdp_model = fsdp_model.to(device=device, dtype=runtime_dtype)
 
-    with torch.no_grad(), torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+    autocast_enabled = runtime_dtype in (torch.float16, torch.bfloat16)
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=autocast_enabled, dtype=runtime_dtype):
         if inference_args.task in GENERATION_TASKS and batch.get("padded_videos"):
             batch["padded_latent"] = make_padded_latent(batch["padded_videos"], batch["vae_data_mode"], vae_model)
 
@@ -453,7 +455,7 @@ def run_inference_batch(
                 "cfg_renorm_min": inference_args.cfg_renorm_min,
                 "cfg_renorm_type": inference_args.cfg_renorm_type,
                 "device": device,
-                "dtype": torch.bfloat16,
+                "dtype": runtime_dtype,
                 "new_token_ids": new_token_ids,
                 "max_samples": inference_args.max_samples,
                 "noise_seed": inference_args.seed,
@@ -516,7 +518,7 @@ def run_inference_batch(
                 max_samples=inference_args.max_samples,
                 max_length=MAX_GENERATION_LENGTH,
                 device=device,
-                dtype=torch.bfloat16,
+                dtype=runtime_dtype,
                 new_token_ids=new_token_ids,
                 pad_token_id=tokenizer.pad_token_id,
                 vocab_size=len(tokenizer),
