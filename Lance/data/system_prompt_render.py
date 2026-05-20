@@ -14,23 +14,6 @@
 
 from __future__ import annotations
 from typing import Any, Dict, List, Tuple
-from jinja2 import Environment, BaseLoader
-
-
-# —— 模板：用显式 \n 控制换行，并用 -%} / {%- 去掉多余空白 ——
-JINJA_PROMPT_TMPL = (
-    "<|im_start|>system\n"
-    "{{ system_prompt }}<|im_end|>\n"
-    "{% for m in msgs -%}"
-    "<|im_start|>{{ m.role }}\n"
-    "{% if not (m.role == 'assistant' and not include_assistant_content) -%}"
-    "{{ m.content | render_mm_list }}"
-    "{% endif -%}"
-    "{% if (not (loop.last and m.role == 'assistant')) or include_assistant_content -%}"
-    "<|im_end|>\n"
-    "{% endif -%}"
-    "{% endfor -%}"
-)
 
 VS, VE = "<|vision_start|>", "<|vision_end|>"
 VP, IP = "<|video_pad|>", "<|image_pad|>"
@@ -145,6 +128,30 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return norm
 
 
+def _render_mm_list(items: Any, force_video_pad: bool = False) -> str:
+    if isinstance(items, str):
+        return items
+    if not isinstance(items, list):
+        return ""
+
+    parts: List[str] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        t = it.get("type")
+        if t == "text":
+            parts.append(it.get("text", ""))
+        elif t == "image":
+            if force_video_pad:
+                parts.append(f"{VS}{IP}{VE}")
+            else:
+                parts.append(f"{VS}{VP}{VE}")
+        elif t == "video":
+            parts.append(f"{VS}{VP}{VE}")
+        # 其他模态可在这里扩展
+    return "".join(parts)
+
+
 def render_qwenvl_prompt(
     messages: List[Dict[str, Any]],
     default_system: str = "You are a helpful assistant.",
@@ -154,41 +161,14 @@ def render_qwenvl_prompt(
     system_prompt = _extract_system_prompt(messages, default_system)
     msgs = _normalize_messages(messages)
 
-    def _render_mm_list(items: Any) -> str:
-        if isinstance(items, str):
-            return items
-        if not isinstance(items, list):
-            return ""
-        parts: List[str] = []
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            t = it.get("type")
-            if t == "text":
-                parts.append(it.get("text", ""))
-            elif t == "image":
-                if force_video_pad:
-                    parts.append("<|vision_start|><|image_pad|><|vision_end|>")
-                else:
-                    parts.append("<|vision_start|><|video_pad|><|vision_end|>")
-            elif t == "video":
-                parts.append("<|vision_start|><|video_pad|><|vision_end|>")
-            # 其他模态可在这里扩展
-        return "".join(parts)
+    parts = [f"<|im_start|>system\n{system_prompt}<|im_end|>\n"]
+    for index, msg in enumerate(msgs):
+        role = msg.get("role", "")
+        is_last_assistant = index == len(msgs) - 1 and role == "assistant"
+        parts.append(f"<|im_start|>{role}\n")
+        if not (role == "assistant" and not include_assistant_content):
+            parts.append(_render_mm_list(msg.get("content", []), force_video_pad=force_video_pad))
+        if (not is_last_assistant) or include_assistant_content:
+            parts.append("<|im_end|>\n")
 
-    env = Environment(
-        loader=BaseLoader(),
-        autoescape=False,
-        trim_blocks=True,  # 去掉块结束后的换行
-        lstrip_blocks=True,  # 去掉块起始前的空白
-        newline_sequence="\n",
-        keep_trailing_newline=False,
-    )
-    env.filters["render_mm_list"] = _render_mm_list
-    template = env.from_string(JINJA_PROMPT_TMPL)
-
-    return template.render(
-        system_prompt=system_prompt,
-        msgs=msgs,
-        include_assistant_content=include_assistant_content,
-    )
+    return "".join(parts)

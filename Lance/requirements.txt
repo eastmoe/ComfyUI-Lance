@@ -1,12 +1,12 @@
-decord==0.6.0
+# decord==0.6.0  # Replaced locally by system ffmpeg/ffprobe video decoding.
 # einops==0.8.1
 einops>=0.6,<0.9
 # flash-attn==2.6.3
 # huggingface-hub==0.29.1
 # imageio==2.34.0
 imageio>=2.31,<3
-imageio-ffmpeg==0.5.1
-Jinja2==3.1.3
+# imageio-ffmpeg==0.5.1  # Replaced by system ffmpeg/ffprobe; no Python ffmpeg wheel required.
+# Jinja2==3.1.3  # Replaced by hand-written Qwen-VL prompt string assembly.
 # ninja>=1.11.1
 # numpy==1.24.4
 numpy>=1.24,<2

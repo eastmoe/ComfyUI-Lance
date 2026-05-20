@@ -15,13 +15,13 @@
 
 import json
 import os
-from typing import Any, Dict, List
+import shutil
+import subprocess
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-import decord
-from decord import VideoReader
 from PIL import Image
 
 from data.video.sampler.utils import FRAME_SAMPLER_TYPES
@@ -223,10 +223,106 @@ class InferenceDataset(Dataset):
 
 
     @staticmethod
-    def _read_decord(video: VideoReader, frame_idx: List[int]) -> List[Image.Image]:
-        # 使用 get_batch() 替换循环单帧读取，可以大幅提升性能
-        frames_np = video.get_batch(frame_idx).asnumpy()
-        return [Image.fromarray(frame) for frame in frames_np]
+    def _require_system_binary(name: str) -> str:
+        path = shutil.which(name)
+        if path is None:
+            raise RuntimeError(
+                f"System {name} was not found. Please install ffmpeg and make sure {name} is in PATH."
+            )
+        return path
+
+    @classmethod
+    def _probe_video_frames(cls, video_path: str) -> Tuple[int, int, int]:
+        ffprobe = cls._require_system_binary("ffprobe")
+        command = [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,nb_frames",
+            "-of",
+            "json",
+            video_path,
+        ]
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        streams = json.loads(result.stdout or "{}").get("streams", [])
+        if not streams:
+            raise RuntimeError(f"No video stream found in {video_path!r}.")
+
+        stream = streams[0]
+        width, height = int(stream["width"]), int(stream["height"])
+        nb_frames = stream.get("nb_frames")
+        if nb_frames and str(nb_frames).isdigit():
+            return width, height, int(nb_frames)
+
+        count_command = [
+            ffprobe,
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "json",
+            video_path,
+        ]
+        count_result = subprocess.run(count_command, check=True, capture_output=True, text=True)
+        count_streams = json.loads(count_result.stdout or "{}").get("streams", [])
+        if not count_streams or not str(count_streams[0].get("nb_read_frames", "")).isdigit():
+            raise RuntimeError(f"Could not determine frame count for {video_path!r}.")
+
+        return width, height, int(count_streams[0]["nb_read_frames"])
+
+    @classmethod
+    def _read_ffmpeg(cls, video_path: str, frame_idx: List[int]) -> List[Image.Image]:
+        if not frame_idx:
+            return []
+
+        width, height, total_frames = cls._probe_video_frames(video_path)
+        unique_indices = sorted({int(idx) for idx in frame_idx})
+        invalid = [idx for idx in unique_indices if idx < 0 or idx >= total_frames]
+        if invalid:
+            raise IndexError(f"Frame index out of range for {video_path!r}: {invalid[:5]}")
+
+        ffmpeg = cls._require_system_binary("ffmpeg")
+        select_expr = "+".join(f"eq(n\\,{idx})" for idx in unique_indices)
+        command = [
+            ffmpeg,
+            "-v",
+            "error",
+            "-i",
+            video_path,
+            "-vf",
+            f"select='{select_expr}'",
+            "-vsync",
+            "0",
+            "-an",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ]
+        result = subprocess.run(command, check=True, capture_output=True)
+
+        frame_size = width * height * 3
+        expected_size = frame_size * len(unique_indices)
+        if len(result.stdout) < expected_size:
+            raise RuntimeError(
+                f"ffmpeg decoded {len(result.stdout) // frame_size} frames, expected {len(unique_indices)}."
+            )
+
+        frames_np = np.frombuffer(result.stdout[:expected_size], dtype=np.uint8)
+        frames_np = frames_np.reshape((len(unique_indices), height, width, 3))
+        frame_map = {
+            idx: Image.fromarray(frames_np[pos].copy())
+            for pos, idx in enumerate(unique_indices)
+        }
+        return [frame_map[int(idx)].copy() for idx in frame_idx]
 
     def get_video_tensor_online(self, media_url, vision_stream, worker_id=0, element_dtype="image") -> torch.Tensor:
         self.vision_stream = vision_stream
@@ -245,16 +341,16 @@ class InferenceDataset(Dataset):
                 image = image.convert("RGB")
             video_frames = [image]
         else:  # for video
-            video_reader = VideoReader(video_stream, ctx=decord.cpu(worker_id % self.cpu_count))
-            total_frames = len(video_reader)
+            _, _, total_frames = self._probe_video_frames(video_stream)
 
             frames_info = {
                 "clip_indices": [(0, total_frames)],
+                # 保持和上游 decord 路径一致的推理采样行为。
                 "fps": 24,
             }
 
             frames_sampler_output: FrameSamplerOutput = self.frame_sampler(frames_info)
-            video_frames = self._read_decord(video_reader, frames_sampler_output.indices)
+            video_frames = self._read_ffmpeg(video_stream, frames_sampler_output.indices)
 
         if vision_stream == "vae_video":
             video_tensor = self.transform(video_frames)  # fix: use List input
