@@ -52,6 +52,26 @@ def _check_inference_interrupted():
         return
 
 
+def _slice_position_ids(position_ids, start, end):
+    if position_ids.dim() >= 3:
+        return position_ids[..., start:end]
+    return position_ids[start:end]
+
+
+def _select_position_ids(position_ids, mask, device):
+    if position_ids is None:
+        position_ids = torch.arange(mask.shape[0], dtype=torch.long, device=device)
+    elif not torch.is_tensor(position_ids):
+        position_ids = torch.as_tensor(position_ids, dtype=torch.long, device=device)
+    else:
+        position_ids = position_ids.to(device=device, dtype=torch.long)
+
+    mask = mask.to(device=position_ids.device, dtype=torch.bool)
+    if position_ids.dim() >= 3:
+        return position_ids[..., mask]
+    return position_ids[mask]
+
+
 class LanceConfig(PretrainedConfig):
     def __init__(
         self,
@@ -611,6 +631,7 @@ class Lance(PreTrainedModel):
             dts = timesteps[:-1] - timesteps[1:]
             timesteps = timesteps[:-1]
 
+            grid_thw_rope = None
             if apply_qwen_2_5_vl_pos_emb:
                 grid_thw_rope = video_grid_thw[i_sample]
 
@@ -648,6 +669,7 @@ class Lance(PreTrainedModel):
                     apply_qwen_2_5_vl_pos_emb,
                     i_sample_task=i_sample_task,
                     i_sample_modality=i_sample_modality,
+                    uncond_pos_ids=current_pos_ids,
                 )
 
             for _ in range(1):
@@ -850,7 +872,7 @@ class Lance(PreTrainedModel):
                 i_sample_modality=uncond_sample_modality,
             )
         else:
-            uncond_pos_ids = torch.tensor(uncond_pos_ids, dtype=torch.long, device=device)[:uncond_seq_len]
+            uncond_pos_ids = _select_position_ids(uncond_pos_ids, uncond_mask, device)
 
         return (
             uncond_text_ids,
@@ -1501,6 +1523,8 @@ class Lance(PreTrainedModel):
             sample_end_idx = cu_sample_lens[i_sample + 1]
             current_seq_len = val_sample_lens[i_sample]
             current_pos_ids = val_packed_position_ids[sample_start_idx:sample_end_idx]
+            current_text_ids = val_packed_text_ids[sample_start_idx:sample_end_idx]
+            grid_thw_rope = video_grid_thw[i_sample] if apply_qwen_2_5_vl_pos_emb else None
             i_sample_task = sample_task[sample_start_idx:sample_end_idx]
             i_sample_modality = sample_modality[sample_start_idx:sample_end_idx]
 
@@ -1522,7 +1546,8 @@ class Lance(PreTrainedModel):
             if cfg_vision_scale > 1.0 and "full" in current_attn_modes:
                 cfg_vision_pro = True
                 vision_uncond_mask =  i_sample_modality <= 1 # i_sample_modality!=4  则为 cfg_vit
-                _, vision_uncond_pos_ids, _ = self.uncond_split_pro_kvcache(vision_uncond_mask, current_text_ids, device, dtype, apply_qwen_2_5_vl_pos_emb, grid_thw_rope = grid_thw_rope[-N_target:], current_attn_modes=current_attn_modes, current_split_lens=current_split_lens, i_sample_task=i_sample_task, i_sample_modality=i_sample_modality ) # NOTE: grid_thw_rope 去掉 vit/vae condition 的项
+                vision_grid_thw_rope = grid_thw_rope[-N_target:] if grid_thw_rope is not None else None
+                _, vision_uncond_pos_ids, _ = self.uncond_split_pro_kvcache(vision_uncond_mask, current_text_ids, device, dtype, apply_qwen_2_5_vl_pos_emb, uncond_pos_ids=current_pos_ids, grid_thw_rope = vision_grid_thw_rope, current_attn_modes=current_attn_modes, current_split_lens=current_split_lens, i_sample_task=i_sample_task, i_sample_modality=i_sample_modality ) # NOTE: grid_thw_rope 去掉 vit/vae condition 的项
 
             for i_target in range(N_noise_element):
                 T, H, W = video_sizes[curr_vae_split_idx]  # ✅ 尺寸用 gen_idx 索引，保证与“GEN 样本序列顺序”一致
@@ -1622,6 +1647,7 @@ class Lance(PreTrainedModel):
             dts = timesteps[:-1] - timesteps[1:]
             timesteps = timesteps[:-1]
 
+            grid_thw_rope = None
             if apply_qwen_2_5_vl_pos_emb:
                 grid_thw_rope = video_grid_thw[i_sample]
 
@@ -1638,7 +1664,7 @@ class Lance(PreTrainedModel):
 
             if cfg_text_scale > 1.0:
                 uncond_mask = i_sample_modality!=0
-                _, uncond_pos_ids, _ = self.uncond_split_pro_kvcache(uncond_mask, current_text_ids, device, dtype, apply_qwen_2_5_vl_pos_emb, grid_thw_rope = grid_thw_rope, current_attn_modes=current_attn_modes, current_split_lens=current_split_lens, i_sample_task=i_sample_task, i_sample_modality=i_sample_modality)
+                _, uncond_pos_ids, _ = self.uncond_split_pro_kvcache(uncond_mask, current_text_ids, device, dtype, apply_qwen_2_5_vl_pos_emb, uncond_pos_ids=current_pos_ids, grid_thw_rope = grid_thw_rope, current_attn_modes=current_attn_modes, current_split_lens=current_split_lens, i_sample_task=i_sample_task, i_sample_modality=i_sample_modality)
 
 
             extra_inputs = {}  # {'mode': "und"}
@@ -1734,7 +1760,7 @@ class Lance(PreTrainedModel):
                     v_t_output = self.language_model.forward_inference(
                         packed_query_sequence=packed_sequence_vae,  # [1026, 1536]
                         query_lens=torch.tensor([packed_seqlens_vae],dtype=torch.int32, device=device),  # [1]
-                        packed_query_position_ids=current_pos_ids[:, :, current_cond_start:current_cond_end],  # [1026]
+                        packed_query_position_ids=_slice_position_ids(current_pos_ids, current_cond_start, current_cond_end),  # [1026]
                         packed_query_indexes=vae_in_packed_sequence_index,  # [1026]
                         past_key_values=gen_context['past_key_values'],  # <class 'modeling.lance.qwen2_navit.NaiveCache'>
                         key_values_lens=gen_context['kv_lens'],  # [1]
@@ -1752,7 +1778,7 @@ class Lance(PreTrainedModel):
                         cfg_text_output = self.language_model.forward_inference(
                             packed_query_sequence=packed_sequence_vae,
                             query_lens=torch.tensor([packed_seqlens_vae],dtype=torch.int32, device=device),
-                            packed_query_position_ids=uncond_pos_ids[:,:,cfg_text_context['kv_lens'][0]:cfg_text_context['kv_lens'][0]+packed_seqlens_vae],
+                            packed_query_position_ids=_slice_position_ids(uncond_pos_ids, cfg_text_context['kv_lens'][0], cfg_text_context['kv_lens'][0]+packed_seqlens_vae),
                             packed_query_indexes=vae_in_packed_sequence_index - sum(i_sample_modality==0), # 对应 packed_sequence_vae 在整个cfg序列中的index
                             past_key_values=cfg_text_context['past_key_values'],
                             key_values_lens=cfg_text_context['kv_lens'],
@@ -1768,7 +1794,7 @@ class Lance(PreTrainedModel):
                             cfg_vision_output = self.language_model.forward_inference(
                                 packed_query_sequence=packed_sequence_vae,
                                 query_lens=torch.tensor([packed_seqlens_vae],dtype=torch.int32, device=device),
-                                packed_query_position_ids=vision_uncond_pos_ids[:,:,cfg_vision_context['kv_lens'][0]:cfg_vision_context['kv_lens'][0]+packed_seqlens_vae],
+                                packed_query_position_ids=_slice_position_ids(vision_uncond_pos_ids, cfg_vision_context['kv_lens'][0], cfg_vision_context['kv_lens'][0]+packed_seqlens_vae),
                                 packed_query_indexes=vae_in_packed_sequence_index - sum(i_sample_modality==4), # 对应 packed_sequence_vae 在整个cfg序列中的index
                                 past_key_values=cfg_vision_context['past_key_values'],
                                 key_values_lens=cfg_vision_context['kv_lens'],
@@ -1891,7 +1917,7 @@ class Lance(PreTrainedModel):
 
             uncond_pos_ids = shift_position_ids(uncond_pos_ids, pos_shift = 1000, attn_modes = uncond_attn_modes, split_lens = uncond_split_lens, shift_attn_mode=['full_noise',"full"], pro_type = 10, i_sample_task=i_sample_task, i_sample_modality=i_sample_modality)
         else:
-            uncond_pos_ids = torch.tensor(uncond_pos_ids, dtype=torch.long, device=device)[:uncond_seq_len]
+            uncond_pos_ids = _select_position_ids(uncond_pos_ids, uncond_mask, device)
 
         return (
             uncond_text_ids,
@@ -1917,7 +1943,7 @@ class Lance(PreTrainedModel):
         output = self.language_model.forward_inference(
             packed_query_sequence=current_sequence[current_cond_start:current_cond_end],
             query_lens=torch.tensor([current_cond_len],dtype=torch.int32, device=device),
-            packed_query_position_ids=current_pos_ids[:, :, current_cond_start:current_cond_end],
+            packed_query_position_ids=_slice_position_ids(current_pos_ids, current_cond_start, current_cond_end),
             #packed_query_indexes=torch.arange(current_cond_start,current_cond_end, dtype=torch.long, device=device), # 放置 当前新输入 的位置。
             packed_query_indexes=torch.arange(gen_context['kv_lens'][0],gen_context['kv_lens'][0] + current_cond_len, dtype=torch.long, device=device), # 放置 当前新输入 的位置。
             past_key_values=gen_context['past_key_values'],
