@@ -435,7 +435,9 @@ class QuantizedLinear(torch.nn.Module):
         qweight = self._buffers.pop("qweight")
         super()._apply(fn)
         moved = fn(qweight)
-        if self.fp8_dtype is not None and moved.dtype != self.fp8_dtype:
+        if self.mode in {"int8", "int4"} and moved.dtype != qweight.dtype:
+            moved = moved.to(qweight.dtype)
+        elif self.fp8_dtype is not None and moved.dtype != self.fp8_dtype:
             moved = moved.to(self.fp8_dtype)
         self._buffers["qweight"] = moved
         return self
@@ -568,8 +570,6 @@ class LanceModelHandle:
         _patch_lance_device(self.device)
         _configure_attention_backend(self.attention_backend)
 
-        from copy import deepcopy
-
         from safetensors.torch import load_file
         from transformers import set_seed
         from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLVisionConfig
@@ -618,8 +618,11 @@ class LanceModelHandle:
         clean_memory(vit_weights)
         _check_interrupted()
 
-        vae_model = WanVideoVAE(dtype=self.dtype)
-        vae_config: AutoEncoderParams = deepcopy(vae_model.vae_config)
+        vae_config = AutoEncoderParams(
+            downsample_spatial=16,
+            downsample_temporal=4,
+            z_channels=48,
+        )
 
         config = LanceConfig(
             visual_gen=True,
@@ -642,7 +645,6 @@ class LanceModelHandle:
             config=config,
             inference_args=inference_args,
         )
-        model = model.to(self.device)
         _check_interrupted()
 
         tokenizer: Qwen2Tokenizer = Qwen2Tokenizer.from_pretrained(str(model_path))
@@ -678,15 +680,15 @@ class LanceModelHandle:
                 != model.language_model.get_output_embeddings().weight.data.data_ptr()
             ), "tie_word_embeddings conflict"
 
-        model = model.to(device=self.device, dtype=self.dtype)
-        model.eval()
-        if hasattr(vae_model, "eval"):
-            vae_model.eval()
-
         quantized_count = _replace_linear_modules(model, self.quantization)
         if quantized_count:
-            model = model.to(self.device)
             print(f"[ComfyUI-Lance] {self.quantization} quantized Linear layers: {quantized_count}")
+
+        model = model.to(device=self.device, dtype=self.dtype)
+        model.eval()
+        vae_model = WanVideoVAE(dtype=self.dtype)
+        if hasattr(vae_model, "eval"):
+            vae_model.eval()
 
         _check_interrupted()
         return LanceRuntime(
