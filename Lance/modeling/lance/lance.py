@@ -470,6 +470,7 @@ class Lance(PreTrainedModel):
 
         x_t_all = []
         max_samples = kwargs.get("max_samples", 16)
+        progress_callback = kwargs.get("progress_callback")
         num_samples = len(val_sample_lens)
         max_samples = min(num_samples, max_samples)
 
@@ -757,6 +758,8 @@ class Lance(PreTrainedModel):
                         v_t = v_t_ * scale
 
                     x_t[current_vae_mse_indexes_local_in_vae] = x_t[current_vae_mse_indexes_local_in_vae] - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
+                    if progress_callback is not None:
+                        progress_callback(1)
 
             # ---- 每个样本各自重排到 [T,H,W,C]，避免用最后一个样本的 t/h/w 去重排整批 ----
             curr_seq_target, patch = 0, []
@@ -1488,6 +1491,7 @@ class Lance(PreTrainedModel):
 
         x_t_all = []
         max_samples = kwargs.get("max_samples", 16)
+        progress_callback = kwargs.get("progress_callback")
         L = max(len(val_sample_lens) - 1, 1)
         max_samples = min(L, max_samples)  # update
 
@@ -1827,6 +1831,8 @@ class Lance(PreTrainedModel):
                         v_t = v_t_ * scale
 
                     x_t[current_vae_mse_indexes_local_in_vae] = x_t[current_vae_mse_indexes_local_in_vae] - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
+                    if progress_callback is not None:
+                        progress_callback(1)
 
             # ---- 每个样本各自重排到 [T,H,W,C]，避免用最后一个样本的 t/h/w 去重排整批 ----
             curr_seq_target, patch = 0, []

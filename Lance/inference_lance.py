@@ -425,6 +425,8 @@ def run_inference_batch(
     save_source_video: bool = False,
     save_path_gen: str = "",
     save_path_gt: str = "",
+    progress_callback=None,
+    stage_callback=None,
 ):
     batch = batch_cpu.cuda(device).to_dict()
     runtime_dtype = getattr(inference_args, "runtime_dtype", torch.bfloat16)
@@ -433,9 +435,13 @@ def run_inference_batch(
     autocast_enabled = runtime_dtype in (torch.float16, torch.bfloat16)
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=autocast_enabled, dtype=runtime_dtype):
         if inference_args.task in GENERATION_TASKS and batch.get("padded_videos"):
+            if stage_callback is not None:
+                stage_callback("编码输入条件")
             batch["padded_latent"] = make_padded_latent(batch["padded_videos"], batch["vae_data_mode"], vae_model)
 
         if inference_args.task in GENERATION_TASKS:
+            if stage_callback is not None:
+                stage_callback("去噪生成")
             params = {
                 "val_packed_text_ids": batch["packed_text_ids"],
                 "val_packed_text_indexes": batch["packed_text_indexes"],
@@ -474,12 +480,15 @@ def run_inference_batch(
                 "cfg_uncond_token_id": inference_args.cfg_uncond_token_id,
                 "index": batch["index"],
                 "val_padded_videos": batch["padded_videos"] if save_source_video else None,
+                "progress_callback": progress_callback,
             }
             if inference_args.use_KVcache:
                 denoise_latent, captions, padded_videos, index = fsdp_model.generate_visual_kvcache(**params)
             else:
                 denoise_latent, captions, padded_videos, index = fsdp_model.generate_visual(**params)
 
+            if stage_callback is not None:
+                stage_callback("VAE 解码与保存")
             for i_val, latent in enumerate(denoise_latent):
                 if inference_args.task in {TASK_IMAGE_EDIT, TASK_VIDEO_EDIT, TASK_I2V}:
                     target_latents = [latent[-1]]
@@ -499,6 +508,8 @@ def run_inference_batch(
                 del v_list, v_thwc, latent, target_latents
                 clean_memory()
 
+            if stage_callback is not None:
+                stage_callback("保存生成结果")
             del denoise_latent, captions, padded_videos, params
             clean_memory()
 

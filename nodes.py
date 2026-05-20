@@ -41,6 +41,11 @@ except Exception:
     model_management = None
 
 try:
+    from comfy.utils import ProgressBar as ComfyProgressBar
+except Exception:
+    ComfyProgressBar = None
+
+try:
     from comfy_api.latest import InputImpl, Types
 except Exception:
     InputImpl = None
@@ -61,6 +66,70 @@ def _ui(display_name: str, tooltip: str, **extra: Any) -> dict[str, Any]:
 def _check_interrupted() -> None:
     if model_management is not None and hasattr(model_management, "throw_exception_if_processing_interrupted"):
         model_management.throw_exception_if_processing_interrupted()
+
+
+def _format_seconds(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, rem = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{rem:02d}s"
+    return f"{minutes}m{rem:02d}s"
+
+
+class _LanceProgress:
+    def __init__(self, total: int, label: str, *, log_interval: float = 5.0) -> None:
+        self.total = max(1, int(total))
+        self.current = 0
+        self.label = label
+        self.start_time = time.monotonic()
+        self.last_log_time = self.start_time
+        self.log_interval = float(log_interval)
+        self.pbar = ComfyProgressBar(self.total) if ComfyProgressBar is not None else None
+        print(f"[ComfyUI-Lance] {self.label} 开始。", flush=True)
+        self._send()
+
+    def _send(self) -> None:
+        if self.pbar is not None:
+            self.pbar.update_absolute(self.current, self.total)
+
+    def _log(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_log_time < self.log_interval:
+            return
+        self.last_log_time = now
+        percent = (self.current / self.total) * 100 if self.total else 100.0
+        elapsed = now - self.start_time
+        eta = ""
+        if 0 < self.current < self.total:
+            eta_seconds = elapsed * (self.total - self.current) / self.current
+            eta = f", 预计剩余 {_format_seconds(eta_seconds)}"
+        print(
+            f"[ComfyUI-Lance] {self.label}: {self.current}/{self.total} "
+            f"({percent:.1f}%), 已用 {_format_seconds(elapsed)}{eta}",
+            flush=True,
+        )
+
+    def update(self, amount: int = 1, label: Optional[str] = None) -> None:
+        self.update_absolute(self.current + int(amount), label=label)
+
+    def update_absolute(self, value: int, *, total: Optional[int] = None, label: Optional[str] = None) -> None:
+        if total is not None:
+            self.total = max(1, int(total))
+        if label:
+            self.label = label
+        self.current = max(0, min(int(value), self.total))
+        self._send()
+        self._log()
+
+    def finish(self, label: Optional[str] = None) -> None:
+        if label:
+            self.label = label
+        self.current = self.total
+        self._send()
+        self._log(force=True)
 
 
 def _comfy_models_dir() -> Path:
@@ -858,17 +927,33 @@ def _load_state_dict_assign(model: torch.nn.Module, state_dict: dict[str, torch.
         return model.load_state_dict(state_dict, strict=strict)
 
 
-def _load_safetensors_into_module(module: torch.nn.Module, path: Path, *, strict: bool = True) -> None:
+def _load_safetensors_into_module(
+    module: torch.nn.Module,
+    path: Path,
+    *,
+    strict: bool = True,
+    progress_label: Optional[str] = None,
+) -> None:
     expected_keys = set(module.state_dict().keys())
     loaded_keys: set[str] = set()
     with _PlainSafetensorsReader(path) as reader:
-        for key in reader.keys():
-            _check_interrupted()
-            if key not in expected_keys:
-                continue
-            tensor = reader.get_tensor(key, clone=True)
-            _set_module_tensor(module, key, tensor)
-            loaded_keys.add(key)
+        keys = reader.keys()
+        progress = _LanceProgress(len(keys), progress_label) if progress_label else None
+        completed = False
+        try:
+            for key in keys:
+                _check_interrupted()
+                if key in expected_keys:
+                    tensor = reader.get_tensor(key, clone=True)
+                    _set_module_tensor(module, key, tensor)
+                    loaded_keys.add(key)
+                    del tensor
+                if progress is not None:
+                    progress.update(1)
+            completed = True
+        finally:
+            if completed and progress is not None:
+                progress.finish()
 
     if strict:
         missing = expected_keys - loaded_keys
@@ -904,6 +989,8 @@ def _load_lance_checkpoint_streaming_quantized(
     model: torch.nn.Module,
     model_path: Path,
     quantization: str,
+    *,
+    progress_label: Optional[str] = None,
 ) -> tuple[int, list[str]]:
     mode = _normalize_quantization_mode(quantization)
     if mode is None:
@@ -920,57 +1007,68 @@ def _load_lance_checkpoint_streaming_quantized(
     with _PlainSafetensorsReader(checkpoint_path) as shard:
         keys = shard.keys()
         total = len(keys)
-        for index, key in enumerate(keys, start=1):
-            _check_interrupted()
-            if key == "latent_pos_embed.pos_embed" or key not in expected_keys:
-                continue
+        progress = _LanceProgress(total, progress_label) if progress_label else None
+        completed = False
+        try:
+            for index, key in enumerate(keys, start=1):
+                _check_interrupted()
+                if key == "latent_pos_embed.pos_embed" or key not in expected_keys:
+                    if progress is not None:
+                        progress.update(1)
+                    continue
 
-            module_name, attr_name = _split_tensor_name(key)
-            module = model.get_submodule(module_name) if module_name else model
-            tensor = shard.get_tensor(key, clone=not (attr_name == "weight" and isinstance(module, torch.nn.Linear)))
+                module_name, attr_name = _split_tensor_name(key)
+                module = model.get_submodule(module_name) if module_name else model
+                tensor = shard.get_tensor(key, clone=not (attr_name == "weight" and isinstance(module, torch.nn.Linear)))
 
-            if attr_name == "weight" and isinstance(module, torch.nn.Linear):
-                expected_shape = (int(module.out_features), int(module.in_features))
-                if tuple(tensor.shape) != expected_shape:
-                    raise RuntimeError(
-                        f"checkpoint 中 {key} 的 shape={tuple(tensor.shape)} 与当前模型结构 {expected_shape} 不一致；"
-                        "请检查 Lance latent_patch_size/模型版本是否匹配。"
+                if attr_name == "weight" and isinstance(module, torch.nn.Linear):
+                    expected_shape = (int(module.out_features), int(module.in_features))
+                    if tuple(tensor.shape) != expected_shape:
+                        raise RuntimeError(
+                            f"checkpoint 中 {key} 的 shape={tuple(tensor.shape)} 与当前模型结构 {expected_shape} 不一致；"
+                            "请检查 Lance latent_patch_size/模型版本是否匹配。"
+                        )
+                    qweight, scale, internal_mode, fp8_dtype = _quantize_weight_tensor(tensor, mode)
+                    bias = None
+                    if module.bias is not None:
+                        bias = module.bias.detach()
+                        if bias.is_floating_point():
+                            bias = bias.to(dtype=torch.float32).cpu()
+                        else:
+                            bias = bias.cpu()
+                    _replace_module(
+                        model,
+                        module_name,
+                        QuantizedLinear.from_quantized_tensors(
+                            qweight=qweight,
+                            scale=scale,
+                            bias=bias,
+                            in_features=module.in_features,
+                            out_features=module.out_features,
+                            mode=internal_mode,
+                            fp8_dtype=fp8_dtype,
+                        ),
                     )
-                qweight, scale, internal_mode, fp8_dtype = _quantize_weight_tensor(tensor, mode)
-                bias = None
-                if module.bias is not None:
-                    bias = module.bias.detach()
-                    if bias.is_floating_point():
-                        bias = bias.to(dtype=torch.float32).cpu()
-                    else:
-                        bias = bias.cpu()
-                _replace_module(
-                    model,
-                    module_name,
-                    QuantizedLinear.from_quantized_tensors(
-                        qweight=qweight,
-                        scale=scale,
-                        bias=bias,
-                        in_features=module.in_features,
-                        out_features=module.out_features,
-                        mode=internal_mode,
-                        fp8_dtype=fp8_dtype,
-                    ),
-                )
-                quantized_module_names.append(module_name)
-            else:
-                tensor = tensor.detach().cpu()
-                _set_module_tensor(model, key, tensor)
+                    quantized_module_names.append(module_name)
+                else:
+                    tensor = tensor.detach().cpu()
+                    _set_module_tensor(model, key, tensor)
 
-            loaded_keys.add(key)
-            now = time.monotonic()
-            if now - last_report >= 5.0:
-                print(
-                    f"[ComfyUI-Lance] 分块量化进度 {index}/{total}，已量化 {len(quantized_module_names)} 个 Linear。",
-                    flush=True,
-                )
-                last_report = now
-            del tensor
+                loaded_keys.add(key)
+                if progress is not None:
+                    progress.update(1)
+                now = time.monotonic()
+                if now - last_report >= 5.0:
+                    print(
+                        f"[ComfyUI-Lance] 分块量化进度 {index}/{total}，已量化 {len(quantized_module_names)} 个 Linear。",
+                        flush=True,
+                    )
+                    last_report = now
+                del tensor
+            completed = True
+        finally:
+            if completed and progress is not None:
+                progress.finish()
 
     gc.collect()
     print(
@@ -1075,11 +1173,16 @@ class LanceModelHandle:
             return runtime
 
     def _load_runtime(self, family: str) -> LanceRuntime:
+        model_label = "图像" if family == "image" else "视频"
+        load_progress = _LanceProgress(12, f"加载 Lance {model_label}模型")
+        runtime_start = time.monotonic()
         _check_interrupted()
         _ensure_models(self.paths, self.download_missing, self.download_source, self.revision, family)
+        load_progress.update(1, "检查 Lance 模型文件")
         _install_lance_path_config(self.paths)
         _patch_lance_device(self.device)
         _configure_attention_backend(self.attention_backend)
+        load_progress.update(1, "配置 Lance 推理环境")
 
         from transformers import set_seed
         from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLVisionConfig
@@ -1087,12 +1190,13 @@ class LanceModelHandle:
         from common.utils.misc import AutoEncoderParams
         from config.config_factory import InferenceArguments, ModelArguments
         from data.data_utils import add_special_tokens
-        from inference_lance import clean_memory, init_from_model_path_if_needed
+        from inference_lance import clean_memory
         from modeling.lance import Lance, LanceConfig, Qwen2ForCausalLM
         from modeling.qwen2 import Qwen2Tokenizer
         from modeling.qwen2.modeling_qwen2 import Qwen2Config
         from modeling.vae.wan.model import WanVideoVAE
         from modeling.vit.qwen2_5_vl_vit import Qwen2_5_VisionTransformerPretrainedModel
+        load_progress.update(1, "导入 Lance 模块")
 
         model_path = self.paths.image_model if family == "image" else self.paths.video_model
         quantization_mode = _normalize_quantization_mode(self.quantization)
@@ -1129,19 +1233,27 @@ class LanceModelHandle:
         llm_config.freeze_und = False
         llm_config.apply_qwen_2_5_vl_pos_emb = inference_args.apply_qwen_2_5_vl_pos_emb
         _set_attention_impl(llm_config, _llm_attention_impl(self.attention_backend))
+        load_progress.update(1, "读取 LLM 配置")
 
         language_model: Qwen2ForCausalLM = Qwen2ForCausalLM(llm_config)
+        load_progress.update(1, "初始化 LLM 结构")
 
         vit_config = Qwen2_5_VLVisionConfig.from_pretrained(str(self.paths.vit))
         _set_attention_impl(vit_config, _vit_attention_impl(self.attention_backend))
         vit_model = Qwen2_5_VisionTransformerPretrainedModel(vit_config)
         vit_weights_loaded = False
+        load_progress.update(1, "初始化 ViT 结构")
 
         def load_vit_weights_if_needed() -> None:
             nonlocal vit_weights_loaded
             if vit_weights_loaded:
                 return
-            _load_safetensors_into_module(vit_model, self.paths.vit / "vit.safetensors", strict=True)
+            _load_safetensors_into_module(
+                vit_model,
+                self.paths.vit / "vit.safetensors",
+                strict=True,
+                progress_label="加载 Qwen2.5-VL ViT 权重",
+            )
             vit_weights_loaded = True
             _check_interrupted()
 
@@ -1173,9 +1285,11 @@ class LanceModelHandle:
             inference_args=inference_args,
         )
         _check_interrupted()
+        load_progress.update(1, "初始化 Lance 结构")
 
         tokenizer: Qwen2Tokenizer = Qwen2Tokenizer.from_pretrained(str(model_path))
         tokenizer, new_token_ids, num_new_tokens = add_special_tokens(tokenizer)
+        load_progress.update(1, "加载 tokenizer")
 
         def apply_tokenizer_shape_and_ties() -> int:
             nonlocal language_model
@@ -1222,6 +1336,7 @@ class LanceModelHandle:
             state_dict = None
             try:
                 cache_start = time.monotonic()
+                load_progress.update(1, "加载量化缓存")
                 print(f"[ComfyUI-Lance] 正在加载量化缓存: {cache_path}", flush=True)
                 payload = _torch_load_weights(cache_path, map_location="cpu")
                 if payload.get("metadata") != expected_cache_metadata:
@@ -1261,6 +1376,7 @@ class LanceModelHandle:
 
         if not loaded_quantized_cache:
             load_vit_weights_if_needed()
+            load_progress.update(1, "加载 ViT 权重")
 
             if quantization_mode is not None:
                 if inference_args.copy_init_moe:
@@ -1270,6 +1386,7 @@ class LanceModelHandle:
                     model,
                     model_path,
                     self.quantization,
+                    progress_label=f"分块读取并量化 Lance {model_label} checkpoint",
                 )
                 remaining_count = _replace_linear_modules(
                     model,
@@ -1286,9 +1403,15 @@ class LanceModelHandle:
                 if inference_args.copy_init_moe:
                     language_model.init_moe()
 
-                init_from_model_path_if_needed(model, model_args)
+                _load_safetensors_into_module(
+                    model,
+                    _checkpoint_file(model_path),
+                    strict=False,
+                    progress_label=f"加载 Lance {model_label} checkpoint",
+                )
                 quantized_module_names = []
                 quantized_count = 0
+            load_progress.update(1, "加载 Lance checkpoint")
 
             image_token_id = apply_tokenizer_shape_and_ties()
             if cache_path is not None and expected_cache_metadata is not None and quantized_count:
@@ -1315,13 +1438,20 @@ class LanceModelHandle:
         if quantized_count:
             print(f"[ComfyUI-Lance] {self.quantization} quantized Linear layers: {quantized_count}")
 
+        load_progress.update(1, f"移动 {model_label}模型到 {self.device}")
         model = model.to(device=self.device, dtype=self.dtype)
         model.eval()
         vae_model = WanVideoVAE(dtype=self.dtype)
         if hasattr(vae_model, "eval"):
             vae_model.eval()
+        load_progress.update(1, "初始化 Wan VAE")
 
         _check_interrupted()
+        load_progress.finish(f"Lance {model_label}模型加载完成")
+        print(
+            f"[ComfyUI-Lance] Lance {model_label}模型总加载用时 {_format_seconds(time.monotonic() - runtime_start)}。",
+            flush=True,
+        )
         return LanceRuntime(
             family=family,
             model=model,
@@ -1416,6 +1546,21 @@ class LanceModelHandle:
         if resolution and resolution != "auto":
             inference_args.resolution = resolution
 
+        generation_progress = None
+        generation_stage_progress = None
+        if task in GENERATION_TASKS:
+            task_label = "图片" if family == "image" else "视频"
+            generation_progress = _LanceProgress(max(1, int(steps)), f"Lance {task_label}去噪生成")
+            generation_stage_progress = _LanceProgress(5, f"Lance {task_label}生成阶段")
+
+        def advance_generation_progress(amount: int = 1) -> None:
+            if generation_progress is not None:
+                generation_progress.update(amount)
+
+        def advance_generation_stage(label: str) -> None:
+            if generation_stage_progress is not None:
+                generation_stage_progress.update(1, label)
+
         data_args = DataArguments()
         apply_inference_defaults(model_args, data_args, inference_args)
         inference_args.runtime_dtype = runtime.dtype
@@ -1429,6 +1574,7 @@ class LanceModelHandle:
 
             max_len_previous = inference_module.MAX_GENERATION_LENGTH
             inference_module.MAX_GENERATION_LENGTH = int(max_new_tokens)
+            inference_completed = False
             try:
                 _check_interrupted()
                 dataset_config = build_dataset_config(
@@ -1448,6 +1594,7 @@ class LanceModelHandle:
                     local_rank=0,
                     world_size=1,
                 )
+                advance_generation_stage("准备输入数据")
                 loader = DataLoader(
                     inference_dataset,
                     batch_size=1,
@@ -1475,6 +1622,8 @@ class LanceModelHandle:
                         save_source_video=False,
                         save_path_gen=str(output_dir),
                         save_path_gt="",
+                        progress_callback=advance_generation_progress if task in GENERATION_TASKS else None,
+                        stage_callback=advance_generation_stage if task in GENERATION_TASKS else None,
                     )
                     del batch_cpu
                     clean_memory()
@@ -1483,8 +1632,13 @@ class LanceModelHandle:
                 save_prompt_results(inference_args.prompt_data_dict, str(output_dir), None)
                 if task in UNDERSTANDING_TASKS:
                     save_understanding_results(inference_args.prompt_data_dict, data_args.input_json, str(output_dir))
+                inference_completed = True
             finally:
                 inference_module.MAX_GENERATION_LENGTH = max_len_previous
+                if inference_completed and generation_progress is not None:
+                    generation_progress.finish()
+                if inference_completed and generation_stage_progress is not None:
+                    generation_stage_progress.finish()
 
         if task in UNDERSTANDING_TASKS:
             answer = ""
