@@ -11,6 +11,9 @@ venv/
 env/
 ENV/
 
+tmp/
+temp/
+
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
