@@ -46,6 +46,11 @@ except Exception:
     ComfyProgressBar = None
 
 try:
+    from tqdm.auto import tqdm as _tqdm
+except Exception:
+    _tqdm = None
+
+try:
     from comfy_api.latest import InputImpl, Types
 except Exception:
     InputImpl = None
@@ -88,7 +93,19 @@ class _LanceProgress:
         self.last_log_time = self.start_time
         self.log_interval = float(log_interval)
         self.pbar = ComfyProgressBar(self.total) if ComfyProgressBar is not None else None
-        print(f"[ComfyUI-Lance] {self.label} 开始。", flush=True)
+        self.tqdm = (
+            _tqdm(
+                total=self.total,
+                desc=f"[ComfyUI-Lance] {self.label}",
+                unit="step",
+                dynamic_ncols=True,
+                leave=True,
+            )
+            if _tqdm is not None
+            else None
+        )
+        if self.tqdm is None:
+            print(f"[ComfyUI-Lance] {self.label} 开始。", flush=True)
         self._send()
 
     def _send(self) -> None:
@@ -96,6 +113,8 @@ class _LanceProgress:
             self.pbar.update_absolute(self.current, self.total)
 
     def _log(self, *, force: bool = False) -> None:
+        if self.tqdm is not None:
+            return
         now = time.monotonic()
         if not force and now - self.last_log_time < self.log_interval:
             return
@@ -120,15 +139,32 @@ class _LanceProgress:
             self.total = max(1, int(total))
         if label:
             self.label = label
+            if self.tqdm is not None:
+                self.tqdm.set_description_str(f"[ComfyUI-Lance] {self.label}")
+        previous = self.current
         self.current = max(0, min(int(value), self.total))
         self._send()
+        if self.tqdm is not None:
+            self.tqdm.total = self.total
+            delta = self.current - previous
+            if delta > 0:
+                self.tqdm.update(delta)
+            else:
+                self.tqdm.n = self.current
+                self.tqdm.refresh()
         self._log()
 
     def finish(self, label: Optional[str] = None) -> None:
         if label:
             self.label = label
+            if self.tqdm is not None:
+                self.tqdm.set_description_str(f"[ComfyUI-Lance] {self.label}")
         self.current = self.total
         self._send()
+        if self.tqdm is not None:
+            self.tqdm.n = self.total
+            self.tqdm.refresh()
+            self.tqdm.close()
         self._log(force=True)
 
 
@@ -1487,6 +1523,9 @@ class LanceModelHandle:
         resolution: str = "auto",
         max_duration: float = 6.0,
         max_new_tokens: int = 256,
+        vae_decode_mode: str = "auto",
+        vae_tile_size: int = 384,
+        vae_tile_overlap: int = 64,
     ) -> dict[str, Any]:
         _ensure_lance_import_path()
         from torch.utils.data import DataLoader
@@ -1545,6 +1584,9 @@ class LanceModelHandle:
         )
         if resolution and resolution != "auto":
             inference_args.resolution = resolution
+        inference_args.vae_decode_mode = str(vae_decode_mode or "auto")
+        inference_args.vae_tile_size = int(vae_tile_size)
+        inference_args.vae_tile_overlap = int(vae_tile_overlap)
 
         generation_progress = None
         generation_stage_progress = None
@@ -1768,6 +1810,18 @@ COMMON_GENERATION_INPUTS = {
     ),
     "cfg_start": ("FLOAT", _ui("CFG Start", "CFG 生效区间起点。", default=0.4, min=0.0, max=1.0, step=0.01)),
     "cfg_end": ("FLOAT", _ui("CFG End", "CFG 生效区间终点。", default=1.0, min=0.0, max=1.0, step=0.01)),
+    "vae_decode_mode": (
+        ["auto", "normal", "tiled"],
+        _ui("VAE Decode Mode", "auto 在 ROCm/HIP 下自动启用空间分块；normal 使用原始解码；tiled 强制空间分块。", default="auto"),
+    ),
+    "vae_tile_size": (
+        "INT",
+        _ui("VAE Tile Size", "VAE 空间分块的输出像素尺寸；仅在 tiled/auto 分块时生效。", default=384, min=128, max=2048, step=16),
+    ),
+    "vae_tile_overlap": (
+        "INT",
+        _ui("VAE Tile Overlap", "VAE 分块拼接的输出像素重叠宽度；重叠越大接缝越少但更慢。", default=64, min=0, max=512, step=16),
+    ),
 }
 
 
@@ -1954,6 +2008,9 @@ class LanceImageGeneration:
         denoise_timestep_shift: float,
         cfg_start: float,
         cfg_end: float,
+        vae_decode_mode: str,
+        vae_tile_size: int,
+        vae_tile_overlap: int,
         resolution: str,
     ):
         result = lance_model.run_task(
@@ -1967,6 +2024,9 @@ class LanceImageGeneration:
             denoise_timestep_shift=denoise_timestep_shift,
             cfg_start=cfg_start,
             cfg_end=cfg_end,
+            vae_decode_mode=vae_decode_mode,
+            vae_tile_size=vae_tile_size,
+            vae_tile_overlap=vae_tile_overlap,
             resolution=_resolution_for_image(resolution),
         )
         return (_comfy_image_from_file(result["path"]), result["path"])
@@ -2013,6 +2073,9 @@ class LanceImageEditing:
         denoise_timestep_shift: float,
         cfg_start: float,
         cfg_end: float,
+        vae_decode_mode: str,
+        vae_tile_size: int,
+        vae_tile_overlap: int,
         resolution: str,
         batch_index: int,
     ):
@@ -2029,6 +2092,9 @@ class LanceImageEditing:
             denoise_timestep_shift=denoise_timestep_shift,
             cfg_start=cfg_start,
             cfg_end=cfg_end,
+            vae_decode_mode=vae_decode_mode,
+            vae_tile_size=vae_tile_size,
+            vae_tile_overlap=vae_tile_overlap,
             resolution=_resolution_for_image(resolution),
         )
         return (_comfy_image_from_file(result["path"]), result["path"])
@@ -2120,6 +2186,9 @@ class LanceTextToVideo:
             denoise_timestep_shift=kwargs["denoise_timestep_shift"],
             cfg_start=kwargs["cfg_start"],
             cfg_end=kwargs["cfg_end"],
+            vae_decode_mode=kwargs["vae_decode_mode"],
+            vae_tile_size=kwargs["vae_tile_size"],
+            vae_tile_overlap=kwargs["vae_tile_overlap"],
             resolution=_resolution_for_video(kwargs["resolution"]),
             max_duration=kwargs["max_duration"],
         )
@@ -2165,6 +2234,9 @@ class LanceImageToVideo:
             denoise_timestep_shift=kwargs["denoise_timestep_shift"],
             cfg_start=kwargs["cfg_start"],
             cfg_end=kwargs["cfg_end"],
+            vae_decode_mode=kwargs["vae_decode_mode"],
+            vae_tile_size=kwargs["vae_tile_size"],
+            vae_tile_overlap=kwargs["vae_tile_overlap"],
             resolution=_resolution_for_video(kwargs["resolution"]),
             max_duration=kwargs["max_duration"],
         )
@@ -2206,6 +2278,9 @@ class LanceVideoEditing:
             denoise_timestep_shift=kwargs["denoise_timestep_shift"],
             cfg_start=kwargs["cfg_start"],
             cfg_end=kwargs["cfg_end"],
+            vae_decode_mode=kwargs["vae_decode_mode"],
+            vae_tile_size=kwargs["vae_tile_size"],
+            vae_tile_overlap=kwargs["vae_tile_overlap"],
             resolution=_resolution_for_video(kwargs["resolution"]),
             max_duration=kwargs["max_duration"],
         )

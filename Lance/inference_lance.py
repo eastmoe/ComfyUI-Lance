@@ -489,13 +489,21 @@ def run_inference_batch(
 
             if stage_callback is not None:
                 stage_callback("VAE 解码与保存")
+            vae_decode_mode = str(getattr(inference_args, "vae_decode_mode", "auto") or "auto").lower()
+            is_hip_runtime = getattr(torch.version, "hip", None) is not None
+            vae_decode_tiled = vae_decode_mode == "tiled" or (vae_decode_mode == "auto" and is_hip_runtime)
+            vae_decode_kwargs = {
+                "tiled": vae_decode_tiled,
+                "tile_size": int(getattr(inference_args, "vae_tile_size", 384)),
+                "tile_overlap": int(getattr(inference_args, "vae_tile_overlap", 64)),
+            }
             for i_val, latent in enumerate(denoise_latent):
                 if inference_args.task in {TASK_IMAGE_EDIT, TASK_VIDEO_EDIT, TASK_I2V}:
                     target_latents = [latent[-1]]
                 else:
                     target_latents = latent
 
-                v_list = [vae_model.vae_decode([latent_])[0] for latent_ in target_latents]
+                v_list = [vae_model.vae_decode([latent_], **vae_decode_kwargs)[0] for latent_ in target_latents]
                 save_item_name = f"{index:06d}" if isinstance(index, int) else index
                 v_thwc = decode_video_tensor(v_list, save_path=save_path_gen, save_half=False, save_item_name=save_item_name)
                 prompt_data_path = f"{save_item_name}.mp4" if v_thwc.shape[0] > 1 else f"{save_item_name}.png"
