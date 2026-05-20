@@ -62,6 +62,7 @@ TASK_X2T_IMAGE = "x2t_image"
 TASK_X2T_VIDEO = "x2t_video"
 TASK_IMAGE_EDIT = "image_edit"
 TASK_VIDEO_EDIT = "video_edit"
+PIL_RESAMPLING = getattr(Image, "Resampling", Image)
 
 GENERATION_TASKS = {
     TASK_T2V,
@@ -265,7 +266,10 @@ def _create_i2v_target_video(image_path: str, output_dir: Path, inference_args: 
     output_path = output_dir / "_i2v_target.mp4"
 
     with Image.open(image_path) as image:
-        frame = image.convert("RGB").resize((inference_args.video_width, inference_args.video_height), Image.LANCZOS)
+        frame = image.convert("RGB").resize(
+            (inference_args.video_width, inference_args.video_height),
+            PIL_RESAMPLING.LANCZOS,
+        )
         frame_np = np.asarray(frame)
 
     frame_count = max(2, int(inference_args.num_frames) * 2)
