@@ -96,7 +96,7 @@ workflows/
 - `加载范围`：`auto/lazy`、`image`、`video`、`image+video`。
 - `Compute dtype`：`bf16`、`fp16`、`fp32`。
 - `Attention Backend`：`auto`、`flash_attention_2`、`sage_attention`、`sdpa`。
-- `量化加载`：`none`、`int8`、`int4`、`fp8_e4m3fn`、`fp8_e5m2`。
+- `量化加载`：`none`、`int8`、`int4`、`fp4`、`fp8_e4m3fn`、`fp8_e5m2`。
 - `量化缓存`：启用后，首次量化会分块读取 checkpoint、边加载边量化，并在 `ComfyUI/models/Lance-quantized-cache` 保存可复用缓存。
 - `重建量化缓存`：忽略已有缓存并重新从原始权重量化生成。
 - `启用 KV Cache`：生成视觉内容时启用 Lance 官方 KV cache 路径，减少重复注意力计算。
@@ -116,7 +116,7 @@ workflows/
 - ComfyUI 集成：使用 `folder_paths` 获取模型、输出和临时目录；输入输出对齐 ComfyUI 原生 `IMAGE`、`VIDEO`、`STRING`。
 - 运行健壮性：在节点边界、文本生成循环和去噪采样循环接入 ComfyUI 中断检查，点击取消后会在下一个检查点退出。
 - 显存管理：加入运行时缓存、懒加载、模型释放节点、临时对象清理和 CUDA cache 清理。
-- 量化缓存：支持分块读取 checkpoint 进行 int8/int4/fp8 量化，缓存包含元数据校验，缓存失配时可重建。
+- 量化缓存：支持分块读取 checkpoint 进行 int8/int4/fp4/fp8 量化，缓存包含元数据校验，缓存失配时可重建。
 - 错误提示：模型目录、CUDA 设备、checkpoint、视频输入类型和外部工具缺失时会给出更直接的报错信息。
 
 ## 注意事项

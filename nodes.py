@@ -487,7 +487,9 @@ def _normalize_quantization_mode(quantization: str) -> Optional[str]:
     mode = (quantization or "none").strip().lower()
     if mode in {"none", "off", "false", ""}:
         return None
-    if mode in {"int8", "int4", "fp8_e4m3fn", "fp8_e5m2", "fp8"}:
+    if mode in {"fp4_e2m1", "fp4_e2m1fn", "fp4_e2m1fn_x2", "float4_e2m1fn_x2"}:
+        return "fp4"
+    if mode in {"int8", "int4", "fp4", "fp8_e4m3fn", "fp8_e5m2", "fp8"}:
         return mode
     raise ValueError(f"不支持的量化格式: {mode}")
 
@@ -685,13 +687,13 @@ def _expected_quantized_linear_shapes(
     mode = mode.lower()
     if mode in {"int8", "fp8_e4m3fn", "fp8_e5m2", "fp8"}:
         qweight_shape = (out_features, in_features)
-    elif mode == "int4":
+    elif mode in {"int4", "fp4"}:
         qweight_shape = (out_features, (in_features + 1) // 2)
     else:
         raise ValueError(f"不支持的量化格式: {mode}")
 
     shapes = {"qweight": qweight_shape}
-    if mode in {"int8", "int4"}:
+    if mode in {"int8", "int4", "fp4"}:
         shapes["scale"] = (out_features,)
     if has_bias:
         shapes["bias"] = (out_features,)
@@ -763,9 +765,43 @@ def _quantization_chunk_rows(weight: torch.Tensor, mode: str) -> int:
     if weight.ndim != 2 or weight.shape[1] == 0:
         return 1
     max_temp_mb = int(os.environ.get("LANCE_QUANTIZE_MAX_TEMP_MB", "256"))
-    multiplier = 4 if mode == "int4" else 2
+    multiplier = 4 if mode in {"int4", "fp4"} else 2
     bytes_per_row = max(1, weight.shape[1] * multiplier * 4)
     return max(1, min(weight.shape[0], (max_temp_mb * 1024 * 1024) // bytes_per_row))
+
+
+def _fp4_e2m1fn_codes(values: torch.Tensor) -> torch.Tensor:
+    abs_values = values.abs()
+    magnitude = torch.zeros_like(abs_values, dtype=torch.uint8)
+    magnitude = torch.where(abs_values >= 0.25, torch.ones_like(magnitude), magnitude)
+    magnitude = torch.where(abs_values >= 0.75, torch.full_like(magnitude, 2), magnitude)
+    magnitude = torch.where(abs_values >= 1.25, torch.full_like(magnitude, 3), magnitude)
+    magnitude = torch.where(abs_values >= 1.75, torch.full_like(magnitude, 4), magnitude)
+    magnitude = torch.where(abs_values >= 2.50, torch.full_like(magnitude, 5), magnitude)
+    magnitude = torch.where(abs_values >= 3.50, torch.full_like(magnitude, 6), magnitude)
+    magnitude = torch.where(abs_values >= 5.00, torch.full_like(magnitude, 7), magnitude)
+    sign = (values < 0).to(torch.uint8) << 3
+    return magnitude | sign
+
+
+def _dequantize_fp4_e2m1fn(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    out_features: int,
+    in_features: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    packed = packed.to(device=device)
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    codes = torch.stack((low, high), dim=-1).reshape(out_features, -1)[:, :in_features]
+    magnitude = codes & 0x07
+    lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=device, dtype=dtype)
+    values = lut[magnitude.long()]
+    signs = torch.where((codes & 0x08) != 0, -1.0, 1.0).to(dtype=dtype, device=device)
+    return values * signs * scale.to(device=device, dtype=dtype)[:, None]
 
 
 def _quantize_weight_tensor(
@@ -805,6 +841,20 @@ def _quantize_weight_tensor(
             qweight[start:end] = q[:, 0::2] | (q[:, 1::2] << 4)
             scale[start:end] = chunk_scale
         return qweight, scale, "int4", None
+
+    if mode == "fp4":
+        qweight = torch.empty((out_features, (in_features + 1) // 2), dtype=torch.uint8)
+        scale = torch.empty((out_features,), dtype=torch.float32)
+        for start in range(0, out_features, chunk_rows):
+            end = min(start + chunk_rows, out_features)
+            chunk = weight[start:end].float()
+            chunk_scale = chunk.abs().amax(dim=1).clamp(min=1e-8) / 6.0
+            q = _fp4_e2m1fn_codes((chunk / chunk_scale[:, None]).clamp(-6.0, 6.0))
+            if in_features % 2:
+                q = torch.nn.functional.pad(q, (0, 1))
+            qweight[start:end] = q[:, 0::2] | (q[:, 1::2] << 4)
+            scale[start:end] = chunk_scale
+        return qweight, scale, "fp4", None
 
     if mode in {"fp8_e4m3fn", "fp8"}:
         if not hasattr(torch, "float8_e4m3fn"):
@@ -885,7 +935,7 @@ class QuantizedLinear(torch.nn.Module):
         qweight = self._buffers.pop("qweight")
         super()._apply(fn)
         moved = fn(qweight)
-        if self.mode in {"int8", "int4"} and moved.dtype != qweight.dtype:
+        if self.mode in {"int8", "int4", "fp4"} and moved.dtype != qweight.dtype:
             moved = moved.to(qweight.dtype)
         elif self.fp8_dtype is not None and moved.dtype != self.fp8_dtype:
             moved = moved.to(self.fp8_dtype)
@@ -902,6 +952,15 @@ class QuantizedLinear(torch.nn.Module):
             unpacked = torch.stack((low, high), dim=-1).reshape(self.out_features, -1)[:, : self.in_features]
             unpacked = unpacked.to(torch.int16) - 8
             return unpacked.to(dtype=dtype) * self.scale.to(device=device, dtype=dtype)[:, None]
+        if self.mode == "fp4":
+            return _dequantize_fp4_e2m1fn(
+                self.qweight,
+                self.scale,
+                out_features=self.out_features,
+                in_features=self.in_features,
+                dtype=dtype,
+                device=device,
+            )
         return self.qweight.to(device=device, dtype=dtype)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -951,6 +1010,10 @@ def _empty_quantized_linear_from_linear(
         qweight = torch.empty(qweight_shape, dtype=torch.uint8, device="meta")
         scale = torch.empty((out_features,), dtype=torch.float32, device="meta")
         internal_mode = "int4"
+    elif mode == "fp4":
+        qweight = torch.empty(qweight_shape, dtype=torch.uint8, device="meta")
+        scale = torch.empty((out_features,), dtype=torch.float32, device="meta")
+        internal_mode = "fp4"
     elif mode in {"fp8_e4m3fn", "fp8"}:
         fp8_dtype = getattr(torch, "float8_e4m3fn", torch.uint8)
         qweight = torch.empty(qweight_shape, dtype=fp8_dtype, device="meta")
@@ -1876,7 +1939,7 @@ COMMON_GENERATION_INPUTS = {
 
 class LanceLoadModel:
     CATEGORY = CATEGORY
-    DESCRIPTION = "从 ComfyUI/models/Lance 加载 bytedance-research/Lance，支持设备选择、FlashAttention/SageAttention 选项和 int8/int4/fp8 量化包装。"
+    DESCRIPTION = "从 ComfyUI/models/Lance 加载 bytedance-research/Lance，支持设备选择、FlashAttention/SageAttention 选项和 int8/int4/fp4/fp8 量化包装。"
     RETURN_TYPES = ("LANCE_MODEL", "STRING")
     RETURN_NAMES = ("lance_model", "状态")
     FUNCTION = "load"
@@ -1907,7 +1970,7 @@ class LanceLoadModel:
                     _ui("Attention Backend", "auto/flash_attention_2 使用 FlashAttention（若可用）；sage_attention 需要 sageattention 包。", default="auto"),
                 ),
                 "quantization": (
-                    ["none", "int8", "int4", "fp8_e4m3fn", "fp8_e5m2"],
+                    ["none", "int8", "int4", "fp4", "fp8_e4m3fn", "fp8_e5m2"],
                     _ui("量化加载", "实验性 Linear 量化；生成质量异常时请先使用 none 原始精度。", default="none"),
                 ),
                 "use_quantization_cache": (
