@@ -1,5 +1,5 @@
 {
-  "category": "Lance/多模态",
+  "category": "eastmoe/Comfy-Lance",
   "node_display_names": {
     "LanceLoadModel": "Lance 加载模型",
     "LanceImageUnderstanding": "Lance 图片理解",

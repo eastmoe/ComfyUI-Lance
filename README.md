@@ -83,7 +83,7 @@ ComfyUI/models/Lance-quantized-cache/
 
 ```text
 workflows/
-  Lance文生图.json
+  Lance_T2I.json
   Lance图片编辑.json
   Lance图片理解.json
 ```

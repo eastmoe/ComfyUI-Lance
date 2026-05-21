@@ -109,7 +109,7 @@ def _tr_mapping(path: str, default: dict[str, str]) -> dict[str, str]:
     return default
 
 
-CATEGORY = _tr_text("category", "Lance/Multimodal")
+CATEGORY = _tr_text("category", "eastmoe/Comfy-Lance")
 
 
 def _clear_cuda_runtime_cache() -> None:
