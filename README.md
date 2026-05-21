@@ -123,7 +123,7 @@ workflows/
 
 ## 注意事项
 
-- Lance 当前推理路径需要 CUDA 设备；大分辨率图像和视频生成对显存要求较高。
+- Lance 当前推理路径需要 CUDA/HIP 设备（可以被torch.device("cuda")调用的设备。）；大分辨率图像和视频生成对显存要求较高。
 - 视频节点要求 ComfyUI 环境支持 `VIDEO` 类型，并要求系统已安装 `ffmpeg/ffprobe`。
 - 首次加载模型或首次创建量化缓存会比较慢；后续会复用 ComfyUI 运行时缓存或量化缓存。
 - 如果遇到 attention backend、量化或 VAE 分块相关问题，优先使用 `attention_backend=sdpa`、`量化加载=none`、`VAE Decode Mode=normal` 排查。
