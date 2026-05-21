@@ -23,7 +23,7 @@ from einops import rearrange
 import torch
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import flex_attention as _torch_flex_attention
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.utils import ModelOutput
 
@@ -47,7 +47,79 @@ from modeling.qwen2.configuration_qwen2 import Qwen2Config
 
 torch._dynamo.config.cache_size_limit = 512
 torch._dynamo.config.accumulated_cache_size_limit = 4096
-flex_attention = torch.compile(flex_attention)
+
+try:
+    import triton  # noqa: F401
+
+    _TRITON_AVAILABLE = True
+except Exception:
+    _TRITON_AVAILABLE = False
+
+_compiled_flex_attention = torch.compile(_torch_flex_attention) if _TRITON_AVAILABLE else None
+_warned_flex_attention_fallback = False
+
+
+def _dense_attention_mask_from_block_mask(block_mask, query: torch.Tensor, key: torch.Tensor) -> Optional[torch.Tensor]:
+    if block_mask is None:
+        return None
+    batch, heads, query_len, _ = query.shape
+    key_len = key.shape[-2]
+    device = query.device
+    b_idx = torch.arange(batch, device=device).view(batch, 1, 1, 1)
+    h_idx = torch.arange(heads, device=device).view(1, heads, 1, 1)
+    q_idx = torch.arange(query_len, device=device).view(1, 1, query_len, 1)
+    kv_idx = torch.arange(key_len, device=device).view(1, 1, 1, key_len)
+    return block_mask.mask_mod(b_idx, h_idx, q_idx, kv_idx).to(torch.bool)
+
+
+def _flex_attention_sdpa_fallback(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    score_mod=None,
+    block_mask=None,
+    scale: Optional[float] = None,
+    enable_gqa: bool = False,
+    return_lse: bool = False,
+    kernel_options=None,
+):
+    if score_mod is not None:
+        raise RuntimeError("Lance SDPA fallback only supports block_mask-based flex_attention.")
+    if return_lse:
+        raise RuntimeError("Lance SDPA fallback does not support return_lse=True.")
+    if enable_gqa and query.shape[1] != key.shape[1]:
+        groups = query.shape[1] // key.shape[1]
+        key = key.repeat_interleave(groups, dim=1)
+        value = value.repeat_interleave(groups, dim=1)
+    attn_mask = _dense_attention_mask_from_block_mask(block_mask, query, key)
+    return scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=attn_mask,
+        dropout_p=0.0,
+        scale=scale,
+    )
+
+
+def flex_attention(*args, **kwargs):
+    global _compiled_flex_attention, _TRITON_AVAILABLE, _warned_flex_attention_fallback
+    if _compiled_flex_attention is not None:
+        try:
+            return _compiled_flex_attention(*args, **kwargs)
+        except Exception as exc:
+            if "triton" not in repr(exc).lower():
+                raise
+            _compiled_flex_attention = None
+            _TRITON_AVAILABLE = False
+    if not _warned_flex_attention_fallback:
+        print(
+            "[ComfyUI-Lance] 未检测到可用 Triton，Navit flex_attention 已自动降级为 PyTorch SDPA；"
+            "推理会更慢，但可避免 inductor/triton 报错。",
+            flush=True,
+        )
+        _warned_flex_attention_fallback = True
+    return _flex_attention_sdpa_fallback(*args, **kwargs)
 
 
 def _match_tensor(target: torch.Tensor, source: torch.Tensor) -> torch.Tensor:

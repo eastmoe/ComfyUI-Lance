@@ -616,8 +616,8 @@ def _signature_digest(payload: dict[str, Any]) -> str:
 
 def _quantization_cache_path(cache_dir: Path, model_path: Path, vit_path: Path, mode: str) -> tuple[Path, dict[str, Any]]:
     metadata = {
-        "cache_version": 2,
-        "format": "lance-weight-only-state-dict",
+        "cache_version": 3,
+        "format": "lance-weight-only-state-dict-safe-fp8",
         "mode": mode,
         "signature": _lance_checkpoint_signature(model_path, vit_path),
     }
@@ -630,6 +630,48 @@ def _torch_load_weights(path: Path, map_location: str | torch.device):
         return torch.load(str(path), map_location=map_location, weights_only=True)
     except TypeError:
         return torch.load(str(path), map_location=map_location)
+
+
+def _float8_dtype_name(dtype: torch.dtype) -> Optional[str]:
+    if hasattr(torch, "float8_e4m3fn") and dtype == torch.float8_e4m3fn:
+        return "float8_e4m3fn"
+    if hasattr(torch, "float8_e5m2") and dtype == torch.float8_e5m2:
+        return "float8_e5m2"
+    return None
+
+
+def _float8_dtype_from_name(name: str) -> torch.dtype:
+    if name == "float8_e4m3fn" and hasattr(torch, "float8_e4m3fn"):
+        return torch.float8_e4m3fn
+    if name == "float8_e5m2" and hasattr(torch, "float8_e5m2"):
+        return torch.float8_e5m2
+    raise RuntimeError(f"当前 PyTorch 不支持量化缓存中的 dtype: {name}")
+
+
+def _pack_quantized_cache_state_dict(state_dict: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], dict[str, str]]:
+    packed: dict[str, torch.Tensor] = {}
+    packed_float8_dtypes: dict[str, str] = {}
+    for key, tensor in state_dict.items():
+        dtype_name = _float8_dtype_name(tensor.dtype)
+        if dtype_name is None:
+            packed[key] = tensor
+            continue
+        packed[key] = tensor.detach().cpu().contiguous().view(torch.uint8).clone()
+        packed_float8_dtypes[key] = dtype_name
+    return packed, packed_float8_dtypes
+
+
+def _unpack_quantized_cache_state_dict(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
+    state_dict = payload["state_dict"]
+    packed_float8_dtypes = payload.get("packed_float8_dtypes", {})
+    for key, dtype_name in packed_float8_dtypes.items():
+        if key not in state_dict:
+            raise RuntimeError(f"量化缓存缺少 fp8 tensor: {key}")
+        tensor = state_dict[key]
+        if tensor.dtype != torch.uint8:
+            raise RuntimeError(f"量化缓存中的 fp8 tensor 未按 uint8 保存: {key} ({tensor.dtype})")
+        state_dict[key] = tensor.contiguous().view(_float8_dtype_from_name(dtype_name))
+    return state_dict
 
 
 def _expected_quantized_linear_shapes(
@@ -1380,7 +1422,7 @@ class LanceModelHandle:
                 payload = _torch_load_weights(cache_path, map_location="cpu")
                 if payload.get("metadata") != expected_cache_metadata:
                     raise RuntimeError("量化缓存元数据与当前模型文件不匹配")
-                state_dict = payload["state_dict"]
+                state_dict = _unpack_quantized_cache_state_dict(payload)
                 quantized_module_names = list(payload["quantized_module_names"])
                 _validate_quantized_cache_for_model(
                     model,
@@ -1458,11 +1500,13 @@ class LanceModelHandle:
                     cache_path.parent.mkdir(parents=True, exist_ok=True)
                     cache_start = time.monotonic()
                     tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+                    cache_state_dict, packed_float8_dtypes = _pack_quantized_cache_state_dict(model.state_dict())
                     torch.save(
                         {
                             "metadata": expected_cache_metadata,
                             "quantized_module_names": quantized_module_names,
-                            "state_dict": model.state_dict(),
+                            "state_dict": cache_state_dict,
+                            "packed_float8_dtypes": packed_float8_dtypes,
                         },
                         str(tmp_path),
                     )
@@ -1946,6 +1990,7 @@ class LanceImageUnderstanding:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("回答",)
     FUNCTION = "understand"
+    OUTPUT_NODE = True
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1976,7 +2021,8 @@ class LanceImageUnderstanding:
             image_path=image_path,
             max_new_tokens=max_new_tokens,
         )
-        return (result["answer"],)
+        answer = result["answer"]
+        return {"ui": {"text": [answer]}, "result": (answer,)}
 
 
 class LanceImageGeneration:
@@ -2112,6 +2158,7 @@ class LanceVideoUnderstanding:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("回答",)
     FUNCTION = "understand"
+    OUTPUT_NODE = True
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -2143,7 +2190,8 @@ class LanceVideoUnderstanding:
             max_duration=max_duration,
             max_new_tokens=max_new_tokens,
         )
-        return (result["answer"],)
+        answer = result["answer"]
+        return {"ui": {"text": [answer]}, "result": (answer,)}
 
 
 VIDEO_GENERATION_INPUTS = {
