@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.so
+*.log
 
 .Python
 .python-version
