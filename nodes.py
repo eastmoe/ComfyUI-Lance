@@ -1250,6 +1250,7 @@ class LanceModelHandle:
             model_path=str(model_path),
             llm_path=str(model_path),
             vit_path=str(self.paths.vit),
+            vit_type="qwen_2_5_vl_original",
             latent_patch_size=[1, 1, 1],
         )
 
@@ -1863,7 +1864,7 @@ class LanceLoadModel:
                 ),
                 "quantization": (
                     ["none", "int8", "int4", "fp8_e4m3fn", "fp8_e5m2"],
-                    _ui("量化加载", "对 Linear 权重做轻量量化包装；none 为原始精度。", default="none"),
+                    _ui("量化加载", "实验性 Linear 量化；生成质量异常时请先使用 none 原始精度。", default="none"),
                 ),
                 "use_quantization_cache": (
                     "BOOLEAN",

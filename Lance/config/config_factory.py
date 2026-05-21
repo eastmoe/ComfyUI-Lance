@@ -152,7 +152,7 @@ class ModelArguments:
     text_cond_dropout_prob:     float = 0.1
     vae_cond_dropout_prob:      float = 0.3
     vit_cond_dropout_prob:      float = 0.3
-    vit_type:                   str = "qwen2_5_vl"  # options: qwen2_5_vl
+    vit_type:                   str = "qwen_2_5_vl_original"  # options: qwen_2_5_vl_original, qwen2_5_vl
 
     cfg_text_scale:             float = 4.0
 
