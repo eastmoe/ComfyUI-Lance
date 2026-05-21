@@ -62,6 +62,41 @@ _INFERENCE_LOCK = threading.RLock()
 _RUNTIME_CACHE: dict[tuple[Any, ...], "LanceRuntime"] = {}
 
 
+def _clear_cuda_runtime_cache() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except RuntimeError:
+            pass
+    if model_management is not None and hasattr(model_management, "soft_empty_cache"):
+        model_management.soft_empty_cache()
+
+
+def _drop_runtime(runtime: "LanceRuntime") -> None:
+    runtime.model = None
+    runtime.vae_model = None
+    runtime.tokenizer = None
+
+
+def _evict_runtime_cache(predicate, *, clear_cuda_cache: bool = True) -> int:
+    runtimes: list[LanceRuntime] = []
+    with _RUNTIME_LOCK:
+        for key in list(_RUNTIME_CACHE):
+            if predicate(key):
+                runtime = _RUNTIME_CACHE.pop(key, None)
+                if runtime is not None:
+                    runtimes.append(runtime)
+    for runtime in runtimes:
+        _drop_runtime(runtime)
+    if runtimes and clear_cuda_cache:
+        _clear_cuda_runtime_cache()
+    elif runtimes:
+        gc.collect()
+    return len(runtimes)
+
+
 def _ui(display_name: str, tooltip: str, **extra: Any) -> dict[str, Any]:
     extra["display_name"] = display_name
     extra["tooltip"] = tooltip
@@ -237,6 +272,29 @@ def _dtype_from_name(name: str) -> torch.dtype:
     if selected in {"fp32", "float32"}:
         return torch.float32
     raise ValueError(f"未知 compute dtype: {name}")
+
+
+def _llm_dtype_from_name(name: str) -> torch.dtype:
+    selected = (name or "bf16").strip().lower()
+    if selected in {"fp16", "float16"}:
+        raise ValueError("LLM Compute dtype 已禁用 fp16；请改用 bf16 或 fp32。")
+    return _dtype_from_name(selected)
+
+
+def _diffusion_dtype_from_name(name: str, llm_dtype: torch.dtype) -> torch.dtype:
+    selected = (name or "same as llm").strip().lower()
+    if selected in {"same as llm", "same as compute", "same", "auto", "跟随 llm", "跟随 compute", "跟随模型"}:
+        return llm_dtype
+    return _dtype_from_name(selected)
+
+
+def _vae_dtype_from_name(name: str, llm_dtype: torch.dtype, diffusion_dtype: torch.dtype) -> torch.dtype:
+    selected = (name or "same as diffusion").strip().lower()
+    if selected in {"same as diffusion", "same as compute", "same", "auto", "跟随 diffusion", "跟随 compute", "跟随模型"}:
+        return diffusion_dtype
+    if selected in {"same as llm", "跟随 llm"}:
+        return llm_dtype
+    return _dtype_from_name(selected)
 
 
 def _ensure_lance_import_path() -> None:
@@ -1232,7 +1290,9 @@ class LanceRuntime:
     image_token_id: int
     device: torch.device
     device_index: int
+    llm_dtype: torch.dtype
     dtype: torch.dtype
+    vae_dtype: torch.dtype
     quantization: str
 
 
@@ -1244,7 +1304,9 @@ class LanceModelHandle:
         paths: LancePaths,
         device: torch.device,
         device_index: int,
+        llm_dtype: torch.dtype,
         dtype: torch.dtype,
+        vae_dtype: torch.dtype,
         attention_backend: str,
         quantization: str,
         quantization_cache_dir: Optional[Path],
@@ -1258,7 +1320,9 @@ class LanceModelHandle:
         self.paths = paths
         self.device = device
         self.device_index = int(device_index)
+        self.llm_dtype = llm_dtype
         self.dtype = dtype
+        self.vae_dtype = vae_dtype
         self.attention_backend = attention_backend
         self.quantization = quantization
         self.quantization_cache_dir = quantization_cache_dir
@@ -1273,7 +1337,9 @@ class LanceModelHandle:
             str(self.model_root.resolve()),
             family,
             str(self.device),
+            str(self.llm_dtype),
             str(self.dtype),
+            str(self.vae_dtype),
             self.attention_backend,
             self.quantization,
             str(self.quantization_cache_dir.resolve()) if self.quantization_cache_dir else None,
@@ -1281,6 +1347,17 @@ class LanceModelHandle:
             self.use_kv_cache,
             self.revision,
         )
+
+    def evict_stale_runtimes(self) -> int:
+        model_root_key = str(self.model_root.resolve())
+        current_keys = {self._runtime_cache_key("image"), self._runtime_cache_key("video")}
+        evicted = _evict_runtime_cache(
+            lambda key: len(key) > 0 and key[0] == model_root_key and key not in current_keys,
+            clear_cuda_cache=True,
+        )
+        if evicted:
+            print(f"[ComfyUI-Lance] 加载参数变化，已释放 {evicted} 个旧 Lance 运行时。", flush=True)
+        return evicted
 
     def preload(self, scope: str) -> str:
         scope = (scope or "auto/lazy").strip().lower()
@@ -1309,6 +1386,18 @@ class LanceModelHandle:
             cached = _RUNTIME_CACHE.get(key)
             if cached is not None:
                 return cached
+            model_root_key = str(self.model_root.resolve())
+            stale_count = _evict_runtime_cache(
+                lambda cached_key: (
+                    len(cached_key) > 1
+                    and cached_key[0] == model_root_key
+                    and cached_key[1] == family
+                    and cached_key != key
+                ),
+                clear_cuda_cache=True,
+            )
+            if stale_count:
+                print(f"[ComfyUI-Lance] 重新加载 Lance {family} 运行时前已释放 {stale_count} 个旧运行时。", flush=True)
             runtime = self._load_runtime(family)
             _RUNTIME_CACHE[key] = runtime
             return runtime
@@ -1586,8 +1675,10 @@ class LanceModelHandle:
 
         load_progress.update(1, f"移动 {model_label}模型到 {self.device}")
         model = model.to(device=self.device, dtype=self.dtype)
+        if hasattr(model, "language_model"):
+            model.language_model.to(device=self.device, dtype=self.llm_dtype)
         model.eval()
-        vae_model = WanVideoVAE(dtype=self.dtype)
+        vae_model = WanVideoVAE(dtype=self.vae_dtype)
         if hasattr(vae_model, "eval"):
             vae_model.eval()
         load_progress.update(1, "初始化 Wan VAE")
@@ -1609,7 +1700,9 @@ class LanceModelHandle:
             image_token_id=image_token_id,
             device=self.device,
             device_index=self.device_index,
+            llm_dtype=self.llm_dtype,
             dtype=self.dtype,
+            vae_dtype=self.vae_dtype,
             quantization=self.quantization,
         )
 
@@ -1717,6 +1810,7 @@ class LanceModelHandle:
 
         data_args = DataArguments()
         apply_inference_defaults(model_args, data_args, inference_args)
+        inference_args.llm_runtime_dtype = runtime.llm_dtype
         inference_args.runtime_dtype = runtime.dtype
         data_args.input_json = build_direct_input_json(inference_args)
         set_seed(inference_args.global_seed)
@@ -1821,23 +1915,13 @@ class LanceModelHandle:
         return {"task": task, "path": result_file, "output_dir": str(output_dir)}
 
     def release(self, clear_cuda_cache: bool = True) -> str:
-        keys = [key for key in _RUNTIME_CACHE if key[0] == str(self.model_root.resolve()) and key[2] == str(self.device)]
-        for key in keys:
-            runtime = _RUNTIME_CACHE.pop(key, None)
-            if runtime is not None:
-                runtime.model = None
-                runtime.vae_model = None
-                runtime.tokenizer = None
-        gc.collect()
-        if clear_cuda_cache and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            try:
-                torch.cuda.ipc_collect()
-            except RuntimeError:
-                pass
-        if clear_cuda_cache and model_management is not None and hasattr(model_management, "soft_empty_cache"):
-            model_management.soft_empty_cache()
-        return f"已释放 {len(keys)} 个 Lance 运行时。"
+        model_root_key = str(self.model_root.resolve())
+        device_key = str(self.device)
+        evicted = _evict_runtime_cache(
+            lambda key: len(key) > 2 and key[0] == model_root_key and key[2] == device_key,
+            clear_cuda_cache=clear_cuda_cache,
+        )
+        return f"已释放 {evicted} 个 Lance 运行时。"
 
 
 def _save_comfy_image(image: torch.Tensor, name: str, batch_index: int = 0) -> str:
@@ -1962,8 +2046,28 @@ class LanceLoadModel:
                 ),
                 "device": (_device_choices(), _ui("设备", "选择 Lance 推理使用的 CUDA 设备。", default="auto")),
                 "compute_dtype": (
-                    ["bf16", "fp16", "fp32"],
-                    _ui("Compute dtype", "模型计算精度；Lance demo 默认使用 bf16。", default="bf16"),
+                    ["bf16", "fp32"],
+                    _ui(
+                        "LLM Compute dtype",
+                        "Lance 语言模型计算精度，控制文本 embedding、注意力/MLP 和 hidden state；FP16 已禁用，建议使用 bf16 或 fp32。",
+                        default="bf16",
+                    ),
+                ),
+                "diffusion_compute_dtype": (
+                    ["same as llm", "bf16", "fp16", "fp32"],
+                    _ui(
+                        "Diffusion Compute dtype",
+                        "Lance diffusion/latent 路径计算精度，控制 x_t、time_embedder、vae2llm、llm2vae；默认跟随 LLM。",
+                        default="same as llm",
+                    ),
+                ),
+                "vae_compute_dtype": (
+                    ["same as diffusion", "same as llm", "bf16", "fp16", "fp32"],
+                    _ui(
+                        "VAE Compute dtype",
+                        "Wan VAE 编码/解码计算精度；默认跟随 Diffusion Compute dtype。",
+                        default="same as diffusion",
+                    ),
                 ),
                 "attention_backend": (
                     ["auto", "flash_attention_2", "sage_attention", "sdpa"],
@@ -2012,8 +2116,10 @@ class LanceLoadModel:
         model_scope: str,
         device: str,
         compute_dtype: str,
-        attention_backend: str,
-        quantization: str,
+        diffusion_compute_dtype: str = "same as llm",
+        vae_compute_dtype: str = "same as diffusion",
+        attention_backend: str = "auto",
+        quantization: str = "none",
         use_quantization_cache: bool = True,
         rebuild_quantization_cache: bool = False,
         use_kv_cache: bool = True,
@@ -2021,9 +2127,30 @@ class LanceLoadModel:
         download_source: str = "huggingface.co",
         revision: str = "",
     ):
+        if (
+            (vae_compute_dtype or "").strip().lower() in {"auto", "flash_attention_2", "sage_attention", "sdpa"}
+            and (attention_backend or "").strip().lower() in {"none", "int8", "int4", "fp4", "fp8_e4m3fn", "fp8_e5m2"}
+        ):
+            quantization = attention_backend
+            attention_backend = vae_compute_dtype
+            vae_compute_dtype = diffusion_compute_dtype
+            diffusion_compute_dtype = "same as llm"
+
+        if (
+            (diffusion_compute_dtype or "").strip().lower() in {"auto", "flash_attention_2", "sage_attention", "sdpa"}
+            and (vae_compute_dtype or "").strip().lower() in {"none", "int8", "int4", "fp4", "fp8_e4m3fn", "fp8_e5m2"}
+        ):
+            quantization = vae_compute_dtype
+            attention_backend = diffusion_compute_dtype
+            diffusion_compute_dtype = "same as llm"
+            vae_compute_dtype = "same as diffusion"
+
         model_root_path = _resolve_model_root(model_root)
         paths = _lance_paths(model_root_path)
         device_obj, device_index = _resolve_device(device)
+        llm_dtype = _llm_dtype_from_name(compute_dtype)
+        dtype = _diffusion_dtype_from_name(diffusion_compute_dtype, llm_dtype)
+        vae_dtype = _vae_dtype_from_name(vae_compute_dtype, llm_dtype, dtype)
         quantization_mode = _normalize_quantization_mode(quantization)
         quantization_cache_dir = _lance_quantization_cache_dir() if use_quantization_cache and quantization_mode else None
         handle = LanceModelHandle(
@@ -2031,7 +2158,9 @@ class LanceLoadModel:
             paths=paths,
             device=device_obj,
             device_index=device_index,
-            dtype=_dtype_from_name(compute_dtype),
+            llm_dtype=llm_dtype,
+            dtype=dtype,
+            vae_dtype=vae_dtype,
             attention_backend=attention_backend,
             quantization=quantization,
             quantization_cache_dir=quantization_cache_dir,
@@ -2041,10 +2170,27 @@ class LanceLoadModel:
             download_source=download_source,
             revision=revision or "",
         )
+        current_runtime_keys = {handle._runtime_cache_key("image"), handle._runtime_cache_key("video")}
+        previous_runtime_keys = set(getattr(self, "_last_runtime_keys", set()))
+        evicted = _evict_runtime_cache(
+            lambda key: key in previous_runtime_keys and key not in current_runtime_keys,
+            clear_cuda_cache=True,
+        )
+        evicted += handle.evict_stale_runtimes()
+        self._last_runtime_keys = current_runtime_keys
         status = handle.preload(model_scope)
+        if evicted:
+            status = f"{status}\n已释放 {evicted} 个旧 Lance 运行时。"
         cache_status = f"\n量化缓存目录: {quantization_cache_dir}" if quantization_cache_dir is not None else ""
         kv_cache_status = "开启" if use_kv_cache else "关闭"
-        return (handle, f"{status}\n模型根目录: {model_root_path}\n设备: {device_obj}\nKV Cache: {kv_cache_status}{cache_status}")
+        return (
+            handle,
+            f"{status}\n模型根目录: {model_root_path}\n设备: {device_obj}\n"
+            f"LLM Compute dtype: {str(llm_dtype).replace('torch.', '')}\n"
+            f"Diffusion Compute dtype: {str(dtype).replace('torch.', '')}\n"
+            f"VAE Compute dtype: {str(vae_dtype).replace('torch.', '')}\n"
+            f"KV Cache: {kv_cache_status}{cache_status}",
+        )
 
 
 class LanceImageUnderstanding:

@@ -203,6 +203,7 @@ class InferenceArguments:
 
     system_prompt_type:         str = "SP0"  # options: SP1, SP2 ...
     use_KVcache:                bool = True
+    fp16_compute_scale:         float = 0.1
 
     # Direct demo inputs. If input_json is supplied, these are ignored.
     prompt:                     str = ""

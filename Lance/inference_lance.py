@@ -430,9 +430,12 @@ def run_inference_batch(
 ):
     batch = batch_cpu.cuda(device).to_dict()
     runtime_dtype = getattr(inference_args, "runtime_dtype", torch.bfloat16)
+    llm_runtime_dtype = getattr(inference_args, "llm_runtime_dtype", runtime_dtype)
     fsdp_model = fsdp_model.to(device=device, dtype=runtime_dtype)
+    if hasattr(fsdp_model, "language_model"):
+        fsdp_model.language_model.to(device=device, dtype=llm_runtime_dtype)
 
-    autocast_enabled = runtime_dtype in (torch.float16, torch.bfloat16)
+    autocast_enabled = runtime_dtype == llm_runtime_dtype and runtime_dtype in (torch.float16, torch.bfloat16)
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=autocast_enabled, dtype=runtime_dtype):
         if inference_args.task in GENERATION_TASKS and batch.get("padded_videos"):
             if stage_callback is not None:
@@ -462,6 +465,7 @@ def run_inference_batch(
                 "cfg_renorm_type": inference_args.cfg_renorm_type,
                 "device": device,
                 "dtype": runtime_dtype,
+                "llm_dtype": llm_runtime_dtype,
                 "new_token_ids": new_token_ids,
                 "max_samples": inference_args.max_samples,
                 "noise_seed": inference_args.seed,
@@ -537,7 +541,7 @@ def run_inference_batch(
                 max_samples=inference_args.max_samples,
                 max_length=MAX_GENERATION_LENGTH,
                 device=device,
-                dtype=runtime_dtype,
+                dtype=llm_runtime_dtype,
                 new_token_ids=new_token_ids,
                 pad_token_id=tokenizer.pad_token_id,
                 vocab_size=len(tokenizer),

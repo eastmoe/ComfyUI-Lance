@@ -43,6 +43,13 @@ from data.common import shift_position_ids
 from copy import deepcopy
 
 
+def _to_runtime_diffusion_dtype(model, tensor):
+    diffusion_dtype = getattr(model, "_runtime_diffusion_dtype", tensor.dtype)
+    if tensor.dtype != diffusion_dtype:
+        return tensor.to(dtype=diffusion_dtype)
+    return tensor
+
+
 def _check_inference_interrupted():
     try:
         from comfy import model_management
@@ -436,6 +443,7 @@ class Lance(PreTrainedModel):
         cfg_vit_scale: float = 1.0, # HACK
         device=None,
         dtype=None,
+        llm_dtype=None,
         new_token_ids=None,
         BLOCK_SIZE: int = 128,
         apply_chat_template: bool = False,
@@ -471,6 +479,8 @@ class Lance(PreTrainedModel):
         x_t_all = []
         max_samples = kwargs.get("max_samples", 16)
         progress_callback = kwargs.get("progress_callback")
+        llm_dtype = llm_dtype or dtype
+        self._runtime_diffusion_dtype = dtype
         num_samples = len(val_sample_lens)
         max_samples = min(num_samples, max_samples)
 
@@ -524,7 +534,7 @@ class Lance(PreTrainedModel):
             # 2. 其次生成 vit uncond 特征 （可选）
             cfg_vit_pro = False
             if cfg_vit_scale > 1.0 and "full" in current_attn_modes:
-                vit_uncond_sequence, vit_uncond_attn_modes, vit_uncond_split_lens, vit_uncond_vae_index, _, vit_uncond_packed_gen_token_indexes, vit_uncond_packed_und_token_indexes, vit_uncond_text_ids, vit_uncond_seq_len, vit_uncond_pad = uncond_split_pro(self.language_model, current_attn_modes, current_split_lens, vae_video_grid_thw, vit_video_grid_thw, curr_vae_split_idx, curr_vit_split_idx, device, dtype, start_id, image_token_id, end_id, BLOCK_SIZE, is_text_uncond = True, is_vit_uncond = True)
+                vit_uncond_sequence, vit_uncond_attn_modes, vit_uncond_split_lens, vit_uncond_vae_index, _, vit_uncond_packed_gen_token_indexes, vit_uncond_packed_und_token_indexes, vit_uncond_text_ids, vit_uncond_seq_len, vit_uncond_pad = uncond_split_pro(self.language_model, current_attn_modes, current_split_lens, vae_video_grid_thw, vit_video_grid_thw, curr_vae_split_idx, curr_vit_split_idx, device, llm_dtype, start_id, image_token_id, end_id, BLOCK_SIZE, is_text_uncond = True, is_vit_uncond = True)
                 cfg_vit_pro = True
 
             for i_target in range(N_noise_element):
@@ -569,7 +579,7 @@ class Lance(PreTrainedModel):
                 curr_padded_latent = torch.cat(curr_padded_latent, dim=0).to(dtype)
 
             # 2. 为当前样本重建输入序列和注意力掩码
-            current_sequence = torch.zeros((current_seq_len, self.hidden_size), device=device, dtype=dtype)
+            current_sequence = torch.zeros((current_seq_len, self.hidden_size), device=device, dtype=llm_dtype)
 
             # --- 文本部分 ---
             text_mask = (val_packed_text_indexes >= sample_start_idx) & (val_packed_text_indexes < sample_end_idx)
@@ -578,7 +588,7 @@ class Lance(PreTrainedModel):
             current_text_ids = val_packed_text_ids[sample_start_idx:sample_end_idx]
 
             # ++ 如果修改 val_data 和train_data对齐即不使用
-            current_text_embedding = self.language_model.model.embed_tokens(current_text_ids).to(dtype=dtype)
+            current_text_embedding = self.language_model.model.embed_tokens(current_text_ids).to(dtype=llm_dtype)
 
             current_sequence[current_text_indexes_local] = current_text_embedding[current_text_indexes_local]
 
@@ -674,12 +684,12 @@ class Lance(PreTrainedModel):
                 )
 
             for _ in range(1):
-                timestep = torch.zeros(x_t.shape[0], device=x_t.device)
+                timestep = torch.zeros(x_t.shape[0], device=x_t.device, dtype=dtype)
                 # for group-by-group generation
 
                 for i, timestep_ in enumerate(timesteps):
                     _check_inference_interrupted()
-                    timestep[current_vae_mse_indexes_local_in_vae] = torch.tensor([timestep_] * current_vae_mse_indexes_local_in_vae.shape[0], device=x_t.device)
+                    timestep[current_vae_mse_indexes_local_in_vae] = torch.tensor([timestep_] * current_vae_mse_indexes_local_in_vae.shape[0], device=x_t.device, dtype=dtype)
                     if timestep_ > cfg_interval[0] and timestep_ <= cfg_interval[1]:
                         cfg_text_scale_ = cfg_text_scale
                         cfg_vit_scale_ = cfg_vit_scale # 默认 vit_uncond 和text_uncond 都采用 同一 cfg_interval
@@ -707,7 +717,7 @@ class Lance(PreTrainedModel):
                         packed_gen_token_indexes=current_vae_token_indexes_local.to(dtype=index_dtype),
                     )
 
-                    self.language_model.to(current_sequence.dtype)
+                    self.language_model.to(dtype=llm_dtype)
                     cond_hidden_state = self.language_model(
                     packed_sequence=current_sequence[:current_seq_len],  # current_sequence,
                     sample_lens=[current_seq_len],  # [current_seq_len_pad]
@@ -716,7 +726,7 @@ class Lance(PreTrainedModel):
                     mode_forward="inference",
                     **extra_inputs,
                 )
-                    v_t = self.llm2vae(cond_hidden_state[current_vae_mse_indexes_local])
+                    v_t = self.llm2vae(cond_hidden_state[current_vae_mse_indexes_local].to(dtype=dtype))
 
                     # --- 引入 cfg ---
                     if cfg_text_scale_ > 1.0:
@@ -757,7 +767,10 @@ class Lance(PreTrainedModel):
                             raise NotImplementedError(f"{cfg_renorm_type} is not suppoprted")
                         v_t = v_t_ * scale
 
-                    x_t[current_vae_mse_indexes_local_in_vae] = x_t[current_vae_mse_indexes_local_in_vae] - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
+                    x_t[current_vae_mse_indexes_local_in_vae] = (
+                        x_t[current_vae_mse_indexes_local_in_vae]
+                        - v_t.to(x_t.device) * dts[i]
+                    )  # velocity pointing from data to noise
                     if progress_callback is not None:
                         progress_callback(1)
 
@@ -907,7 +920,7 @@ class Lance(PreTrainedModel):
             **uncond_extra_inputs,
         )
         uncond_current_vae_mse_indexes_local = current_vae_mse_indexes_local - (current_seq_len - uncond_seq_len)  # TODO : 如果是多个target image 且中间有文本信息，可能需要修改
-        cfg_text_v_t = self.llm2vae(uncond_hidden_state[uncond_current_vae_mse_indexes_local])
+        cfg_text_v_t = self.llm2vae(_to_runtime_diffusion_dtype(self, uncond_hidden_state[uncond_current_vae_mse_indexes_local]))
 
         return cfg_text_v_t
 
@@ -1460,6 +1473,7 @@ class Lance(PreTrainedModel):
         cfg_vit_scale: float = 1.0, # NOTE ： 对应 cfg_vision_scale
         device=None,
         dtype=None,
+        llm_dtype=None,
         new_token_ids=None,
         BLOCK_SIZE: int = 128,
         apply_chat_template: bool = False,
@@ -1492,6 +1506,8 @@ class Lance(PreTrainedModel):
         x_t_all = []
         max_samples = kwargs.get("max_samples", 16)
         progress_callback = kwargs.get("progress_callback")
+        llm_dtype = llm_dtype or dtype
+        self._runtime_diffusion_dtype = dtype
         L = max(len(val_sample_lens) - 1, 1)
         max_samples = min(L, max_samples)  # update
 
@@ -1595,7 +1611,7 @@ class Lance(PreTrainedModel):
                 curr_padded_latent = torch.cat(curr_padded_latent, dim=0).to(dtype)
 
             # 2. 为当前样本重建输入序列和注意力掩码
-            current_sequence = torch.zeros((current_seq_len, self.hidden_size), device=device, dtype=dtype)
+            current_sequence = torch.zeros((current_seq_len, self.hidden_size), device=device, dtype=llm_dtype)
 
             # --- 文本部分 ---
             text_mask = (val_packed_text_indexes >= sample_start_idx) & (val_packed_text_indexes < sample_end_idx)
@@ -1604,7 +1620,7 @@ class Lance(PreTrainedModel):
             current_text_ids = val_packed_text_ids[sample_start_idx:sample_end_idx]
 
             # ++ 如果修改 val_data 和train_data对齐即不使用
-            current_text_embedding = self.language_model.model.embed_tokens(current_text_ids).to(dtype=dtype)
+            current_text_embedding = self.language_model.model.embed_tokens(current_text_ids).to(dtype=llm_dtype)
 
             current_sequence[current_text_indexes_local] = current_text_embedding[current_text_indexes_local]
 
@@ -1682,8 +1698,8 @@ class Lance(PreTrainedModel):
                     packed_gen_token_indexes=current_vae_token_indexes_local.to(dtype=index_dtype),
                 )
 
-            timestep = torch.zeros(x_t.shape[0], device=x_t.device)
-            timestep[current_vae_mse_indexes_local_in_vae] = torch.tensor([1.] * current_vae_mse_indexes_local_in_vae.shape[0], device=x_t.device)
+            timestep = torch.zeros(x_t.shape[0], device=x_t.device, dtype=dtype)
+            timestep[current_vae_mse_indexes_local_in_vae] = torch.tensor([1.] * current_vae_mse_indexes_local_in_vae.shape[0], device=x_t.device, dtype=dtype)
 
             # --- 存入 视觉特征 编码 （vae condition）---
             timestep_embed = self.time_embedder(timestep)
@@ -1700,6 +1716,7 @@ class Lance(PreTrainedModel):
 
             current_cond_start, current_cond_end = 0, 0
 
+            self.language_model.to(dtype=llm_dtype)
             self.language_model.eval()
             self.eval()
             for i_attn_mode_, current_cond_len in zip(current_attn_modes, current_split_lens):
@@ -1730,13 +1747,13 @@ class Lance(PreTrainedModel):
 
 
             for _ in range(1):
-                timestep = torch.zeros(x_t.shape[0], device=x_t.device)
+                timestep = torch.zeros(x_t.shape[0], device=x_t.device, dtype=dtype)
                 # for group-by-group generation
 
                 for i, timestep_ in enumerate(timesteps):
                     _check_inference_interrupted()
 
-                    timestep[current_vae_mse_indexes_local_in_vae] = torch.tensor([timestep_] * current_vae_mse_indexes_local_in_vae.shape[0], device=x_t.device)
+                    timestep[current_vae_mse_indexes_local_in_vae] = torch.tensor([timestep_] * current_vae_mse_indexes_local_in_vae.shape[0], device=x_t.device, dtype=dtype)
                     if timestep_ > cfg_interval[0] and timestep_ <= cfg_interval[1]:
                         cfg_text_scale_ = cfg_text_scale
                         cfg_vision_scale_ = cfg_vision_scale # 默认 vit_uncond 和text_uncond 都采用 同一 cfg_interval
@@ -1774,7 +1791,7 @@ class Lance(PreTrainedModel):
                         **extra_inputs_vae,
                     )
 
-                    v_t = self.llm2vae(v_t_output.packed_query_sequence)
+                    v_t = self.llm2vae(v_t_output.packed_query_sequence.to(dtype=dtype))
                     v_t = v_t[target_packed_vae_token_indexes]
 
                     # --- 引入 cfg ---
@@ -1791,7 +1808,7 @@ class Lance(PreTrainedModel):
                             is_causal=False,
                             **extra_inputs_vae,
                         )
-                        cfg_text_v_t = self.llm2vae(cfg_text_output.packed_query_sequence)
+                        cfg_text_v_t = self.llm2vae(cfg_text_output.packed_query_sequence.to(dtype=dtype))
                         cfg_text_v_t = cfg_text_v_t[target_packed_vae_token_indexes]
 
                         if cfg_vision_pro:
@@ -1808,7 +1825,7 @@ class Lance(PreTrainedModel):
                                 **extra_inputs_vae,
                             )
 
-                            cfg_text_vision_v_t = self.llm2vae(cfg_vision_output.packed_query_sequence)
+                            cfg_text_vision_v_t = self.llm2vae(cfg_vision_output.packed_query_sequence.to(dtype=dtype))
                             cfg_text_vision_v_t = cfg_text_vision_v_t[target_packed_vae_token_indexes]
 
                             v_t_ = cfg_text_vision_v_t + cfg_text_scale_ * (v_t - cfg_text_v_t) + cfg_vision_scale_  * (cfg_text_v_t - cfg_text_vision_v_t)
@@ -1830,7 +1847,10 @@ class Lance(PreTrainedModel):
                             raise NotImplementedError(f"{cfg_renorm_type} is not suppoprted")
                         v_t = v_t_ * scale
 
-                    x_t[current_vae_mse_indexes_local_in_vae] = x_t[current_vae_mse_indexes_local_in_vae] - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
+                    x_t[current_vae_mse_indexes_local_in_vae] = (
+                        x_t[current_vae_mse_indexes_local_in_vae]
+                        - v_t.to(x_t.device) * dts[i]
+                    )  # velocity pointing from data to noise
                     if progress_callback is not None:
                         progress_callback(1)
 

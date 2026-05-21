@@ -94,7 +94,9 @@ workflows/
 
 - `设备`：`auto`、`cuda`、`cuda:0` 等。
 - `加载范围`：`auto/lazy`、`image`、`video`、`image+video`。
-- `Compute dtype`：`bf16`、`fp16`、`fp32`。
+- `LLM Compute dtype`：Lance 语言模型精度，控制文本 embedding、注意力/MLP 与 hidden state，可选 `bf16`、`fp32`；`fp16` 会导致 NaN/黑图，已从节点选项中移除。
+- `Diffusion Compute dtype`：Lance diffusion/latent 路径精度，控制 `x_t`、`time_embedder`、`vae2llm`、`llm2vae`，默认 `same as llm`。
+- `VAE Compute dtype`：Wan VAE 编码/解码精度，默认 `same as diffusion`，也可跟随 LLM 或单独设为 `bf16`、`fp16`、`fp32`。
 - `Attention Backend`：`auto`、`flash_attention_2`、`sage_attention`、`sdpa`。
 - `量化加载`：`none`、`int8`、`int4`、`fp4`、`fp8_e4m3fn`、`fp8_e5m2`。
 - `量化缓存`：启用后，首次量化会分块读取 checkpoint、边加载边量化，并在 `ComfyUI/models/Lance-quantized-cache` 保存可复用缓存。

@@ -181,11 +181,12 @@ class WanVideoVAE(object):
     @torch.no_grad()
     def vae_encode(self, samples: List[Tensor], **kwargs) -> List[Tensor]:
         device = get_device()
+        autocast_enabled = self.dtype in (torch.float16, torch.bfloat16)
 
         latents = []
-        with torch.autocast(device_type="cuda", dtype=self.dtype):
+        with torch.autocast(device_type="cuda", dtype=self.dtype, enabled=autocast_enabled):
             for x in samples:
-                x = x.to(device=device).unsqueeze(0)  # 1CTHW
+                x = x.to(device=device, dtype=self.dtype).unsqueeze(0)  # 1CTHW
 
                 u, log_var = self.vae.encode(x)  # [1,48,t,h,w], [1,48,t,h,w]
 
@@ -204,11 +205,12 @@ class WanVideoVAE(object):
         tiled = bool(kwargs.get("tiled", False))
         tile_size = int(kwargs.get("tile_size", 384))
         tile_overlap = int(kwargs.get("tile_overlap", 64))
+        autocast_enabled = self.dtype in (torch.float16, torch.bfloat16)
 
         samples = []
-        with torch.autocast(device_type="cuda", dtype=self.dtype):
+        with torch.autocast(device_type="cuda", dtype=self.dtype, enabled=autocast_enabled):
             for u in latents:
-                u = u.unsqueeze(0).to(device=device)  # -> [1,t,h,w,48]
+                u = u.unsqueeze(0).to(device=device, dtype=self.dtype)  # -> [1,t,h,w,48]
                 u = rearrange(u, "b ... c -> b c ...")  # -> [1,48,t,h,w]
 
                 if tiled and tile_size > 0:
