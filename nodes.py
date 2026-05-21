@@ -25,7 +25,7 @@ COMFY_ROOT = REPO_ROOT.parent.parent
 LANCE_SRC = REPO_ROOT / "Lance"
 LANCE_REPO_ID = "bytedance-research/Lance"
 QUANTIZATION_CACHE_DIR_NAME = "Lance-quantized-cache"
-CATEGORY = "Lance/多模态"
+DEFAULT_LOCALE = "zh-cn"
 
 if str(COMFY_ROOT) not in sys.path and (COMFY_ROOT / "folder_paths.py").is_file():
     sys.path.insert(0, str(COMFY_ROOT))
@@ -60,6 +60,54 @@ except Exception:
 _RUNTIME_LOCK = threading.RLock()
 _INFERENCE_LOCK = threading.RLock()
 _RUNTIME_CACHE: dict[tuple[Any, ...], "LanceRuntime"] = {}
+
+
+def _load_localization(locale: str) -> dict[str, Any]:
+    locale_name = (locale or DEFAULT_LOCALE).strip().lower()
+    path = REPO_ROOT / "local" / locale_name / "nodes.json"
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        print(f"[ComfyUI-Lance] Failed to load localization file {path}: {exc}", flush=True)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+_LOCALIZATION = _load_localization(os.environ.get("COMFYUI_LANCE_LOCALE", DEFAULT_LOCALE))
+
+
+def _tr(path: str, default: Any) -> Any:
+    value: Any = _LOCALIZATION
+    for part in path.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return default
+        value = value[part]
+    return value
+
+
+def _tr_text(path: str, default: str) -> str:
+    value = _tr(path, default)
+    return value if isinstance(value, str) else default
+
+
+def _tr_names(path: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    value = _tr(path, list(default))
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return tuple(value)
+    return default
+
+
+def _tr_mapping(path: str, default: dict[str, str]) -> dict[str, str]:
+    value = _tr(path, default)
+    if isinstance(value, dict) and all(isinstance(key, str) and isinstance(val, str) for key, val in value.items()):
+        return value
+    return default
+
+
+CATEGORY = _tr_text("category", "Lance/Multimodal")
 
 
 def _clear_cuda_runtime_cache() -> None:
@@ -97,9 +145,12 @@ def _evict_runtime_cache(predicate, *, clear_cuda_cache: bool = True) -> int:
     return len(runtimes)
 
 
-def _ui(display_name: str, tooltip: str, **extra: Any) -> dict[str, Any]:
-    extra["display_name"] = display_name
-    extra["tooltip"] = tooltip
+def _ui(key: str, display_name: str, tooltip: str, **extra: Any) -> dict[str, Any]:
+    text = _tr(f"ui.{key}", {})
+    if not isinstance(text, dict):
+        text = {}
+    extra["display_name"] = text.get("display_name", display_name)
+    extra["tooltip"] = text.get("tooltip", tooltip)
     return extra
 
 
@@ -1997,35 +2048,38 @@ def _resolution_for_video(resolution: str) -> str:
 
 
 COMMON_GENERATION_INPUTS = {
-    "seed": ("INT", _ui("Seed", "采样随机种子。", default=42, min=0, max=2**31 - 1, step=1)),
-    "steps": ("INT", _ui("Denoise Steps", "去噪步数；步数越高通常越慢。", default=30, min=1, max=200, step=1)),
-    "cfg_scale": ("FLOAT", _ui("CFG Scale", "文本 CFG 强度。", default=4.0, min=0.1, max=30.0, step=0.1)),
+    "seed": ("INT", _ui("common_generation.seed", "Seed", "Sampling random seed.", default=42, min=0, max=2**31 - 1, step=1)),
+    "steps": ("INT", _ui("common_generation.steps", "Denoise Steps", "Denoising steps; higher values are usually slower.", default=30, min=1, max=200, step=1)),
+    "cfg_scale": ("FLOAT", _ui("common_generation.cfg_scale", "CFG Scale", "Text classifier-free guidance scale.", default=4.0, min=0.1, max=30.0, step=0.1)),
     "denoise_timestep_shift": (
         "FLOAT",
-        _ui("Timestep Shift", "去噪 timestep shift，沿用 Lance demo 默认值。", default=3.0, min=0.1, max=20.0, step=0.1),
+        _ui("common_generation.denoise_timestep_shift", "Timestep Shift", "Denoising timestep shift, matching the Lance demo default.", default=3.0, min=0.1, max=20.0, step=0.1),
     ),
-    "cfg_start": ("FLOAT", _ui("CFG Start", "CFG 生效区间起点。", default=0.4, min=0.0, max=1.0, step=0.01)),
-    "cfg_end": ("FLOAT", _ui("CFG End", "CFG 生效区间终点。", default=1.0, min=0.0, max=1.0, step=0.01)),
+    "cfg_start": ("FLOAT", _ui("common_generation.cfg_start", "CFG Start", "Start of the CFG active interval.", default=0.4, min=0.0, max=1.0, step=0.01)),
+    "cfg_end": ("FLOAT", _ui("common_generation.cfg_end", "CFG End", "End of the CFG active interval.", default=1.0, min=0.0, max=1.0, step=0.01)),
     "vae_decode_mode": (
         ["auto", "normal", "tiled"],
-        _ui("VAE Decode Mode", "auto 在 ROCm/HIP 下自动启用空间分块；normal 使用原始解码；tiled 强制空间分块。", default="auto"),
+        _ui("common_generation.vae_decode_mode", "VAE Decode Mode", "auto enables spatial tiling on ROCm/HIP; normal uses standard decoding; tiled forces spatial tiling.", default="auto"),
     ),
     "vae_tile_size": (
         "INT",
-        _ui("VAE Tile Size", "VAE 空间分块的输出像素尺寸；仅在 tiled/auto 分块时生效。", default=384, min=128, max=2048, step=16),
+        _ui("common_generation.vae_tile_size", "VAE Tile Size", "Output pixel size of each VAE spatial tile; only active in tiled/auto tiling.", default=384, min=128, max=2048, step=16),
     ),
     "vae_tile_overlap": (
         "INT",
-        _ui("VAE Tile Overlap", "VAE 分块拼接的输出像素重叠宽度；重叠越大接缝越少但更慢。", default=64, min=0, max=512, step=16),
+        _ui("common_generation.vae_tile_overlap", "VAE Tile Overlap", "Output pixel overlap for stitching VAE tiles; larger overlap reduces seams but is slower.", default=64, min=0, max=512, step=16),
     ),
 }
 
 
 class LanceLoadModel:
     CATEGORY = CATEGORY
-    DESCRIPTION = "从 ComfyUI/models/Lance 加载 bytedance-research/Lance，支持设备选择、FlashAttention/SageAttention 选项和 int8/int4/fp4/fp8 量化包装。"
+    DESCRIPTION = _tr_text(
+        "descriptions.LanceLoadModel",
+        "Load bytedance-research/Lance from ComfyUI/models/Lance with device selection, FlashAttention/SageAttention options, and int8/int4/fp4/fp8 quantization wrappers.",
+    )
     RETURN_TYPES = ("LANCE_MODEL", "STRING")
-    RETURN_NAMES = ("lance_model", "状态")
+    RETURN_NAMES = _tr_names("return_names.LanceLoadModel", ("lance_model", "Status"))
     FUNCTION = "load"
 
     @classmethod
@@ -2035,77 +2089,82 @@ class LanceLoadModel:
                 "model_root": (
                     "STRING",
                     _ui(
-                        "模型根目录",
-                        "auto 使用 ComfyUI/models/Lance；也可以填写自定义绝对路径。",
+                        "load_model.model_root",
+                        "Model Root",
+                        "Use auto for ComfyUI/models/Lance, or enter a custom absolute path.",
                         default="auto",
                     ),
                 ),
                 "model_scope": (
                     ["auto/lazy", "image", "video", "image+video"],
-                    _ui("加载范围", "auto/lazy 会在首次任务运行时按需加载对应 image/video 模型。", default="auto/lazy"),
+                    _ui("load_model.model_scope", "Load Scope", "auto/lazy loads the image/video model on demand when the first task runs.", default="auto/lazy"),
                 ),
-                "device": (_device_choices(), _ui("设备", "选择 Lance 推理使用的 CUDA 设备。", default="auto")),
+                "device": (_device_choices(), _ui("load_model.device", "Device", "Select the CUDA device used for Lance inference.", default="auto")),
                 "compute_dtype": (
                     ["bf16", "fp32"],
                     _ui(
+                        "load_model.compute_dtype",
                         "LLM Compute dtype",
-                        "Lance 语言模型计算精度，控制文本 embedding、注意力/MLP 和 hidden state；FP16 已禁用，建议使用 bf16 或 fp32。",
+                        "Compute dtype for the Lance language model, covering text embeddings, attention/MLP, and hidden states. FP16 is disabled; bf16 or fp32 is recommended.",
                         default="bf16",
                     ),
                 ),
                 "diffusion_compute_dtype": (
                     ["same as llm", "bf16", "fp16", "fp32"],
                     _ui(
+                        "load_model.diffusion_compute_dtype",
                         "Diffusion Compute dtype",
-                        "Lance diffusion/latent 路径计算精度，控制 x_t、time_embedder、vae2llm、llm2vae；默认跟随 LLM。",
+                        "Compute dtype for the Lance diffusion/latent path, covering x_t, time_embedder, vae2llm, and llm2vae. Defaults to the LLM dtype.",
                         default="same as llm",
                     ),
                 ),
                 "vae_compute_dtype": (
                     ["same as diffusion", "same as llm", "bf16", "fp16", "fp32"],
                     _ui(
+                        "load_model.vae_compute_dtype",
                         "VAE Compute dtype",
-                        "Wan VAE 编码/解码计算精度；默认跟随 Diffusion Compute dtype。",
+                        "Compute dtype for Wan VAE encoding/decoding. Defaults to the Diffusion Compute dtype.",
                         default="same as diffusion",
                     ),
                 ),
                 "attention_backend": (
                     ["auto", "flash_attention_2", "sage_attention", "sdpa"],
-                    _ui("Attention Backend", "auto/flash_attention_2 使用 FlashAttention（若可用）；sage_attention 需要 sageattention 包。", default="auto"),
+                    _ui("load_model.attention_backend", "Attention Backend", "auto/flash_attention_2 uses FlashAttention when available; sage_attention requires the sageattention package.", default="auto"),
                 ),
                 "quantization": (
                     ["none", "int8", "int4", "fp4", "fp8_e4m3fn", "fp8_e5m2"],
-                    _ui("量化加载", "实验性 Linear 量化；生成质量异常时请先使用 none 原始精度。", default="none"),
+                    _ui("load_model.quantization", "Quantization", "Experimental Linear quantization. Use none for original precision first if generation quality is abnormal.", default="none"),
                 ),
                 "use_quantization_cache": (
                     "BOOLEAN",
                     _ui(
-                        "量化缓存",
-                        "启用后将可复用量化权重保存到 ComfyUI/models/Lance-quantized-cache。",
+                        "load_model.use_quantization_cache",
+                        "Quantization Cache",
+                        "When enabled, reusable quantized weights are saved to ComfyUI/models/Lance-quantized-cache.",
                         default=True,
                     ),
                 ),
                 "rebuild_quantization_cache": (
                     "BOOLEAN",
-                    _ui("重建量化缓存", "忽略已有量化缓存并重新从原始权重量化生成。", default=False),
+                    _ui("load_model.rebuild_quantization_cache", "Rebuild Quantization Cache", "Ignore the existing quantization cache and regenerate it from the original weights.", default=False),
                 ),
                 "use_kv_cache": (
                     "BOOLEAN",
-                    _ui("启用 KV Cache", "生成视觉内容时启用 Lance 官方 KV cache 路径；可降低重复注意力计算。", default=True),
+                    _ui("load_model.use_kv_cache", "Enable KV Cache", "Enable Lance's official KV cache path for visual generation to reduce repeated attention computation.", default=True),
                 ),
             },
             "optional": {
                 "download_missing": (
                     "BOOLEAN",
-                    _ui("缺失时下载", "模型缺失时从 Hugging Face 仓库下载到模型根目录。", default=False),
+                    _ui("load_model.download_missing", "Download Missing Files", "Download missing model files from the Hugging Face repository to the model root.", default=False),
                 ),
                 "download_source": (
                     ["huggingface.co", "hf-mirror.com"],
-                    _ui("下载源", "自动下载使用的源。", default="huggingface.co"),
+                    _ui("load_model.download_source", "Download Source", "Source used for automatic downloads.", default="huggingface.co"),
                 ),
                 "revision": (
                     "STRING",
-                    _ui("Revision", "Hugging Face revision；留空使用默认分支。", default=""),
+                    _ui("load_model.revision", "Revision", "Hugging Face revision. Leave empty to use the default branch.", default=""),
                 ),
             },
         }
@@ -2195,9 +2254,9 @@ class LanceLoadModel:
 
 class LanceImageUnderstanding:
     CATEGORY = CATEGORY
-    DESCRIPTION = "使用 Lance 进行图片理解，输入/输出使用 ComfyUI IMAGE 和 STRING。"
+    DESCRIPTION = _tr_text("descriptions.LanceImageUnderstanding", "Use Lance for image understanding with ComfyUI IMAGE input and STRING output.")
     RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("回答",)
+    RETURN_NAMES = _tr_names("return_names.LanceImageUnderstanding", ("Answer",))
     FUNCTION = "understand"
     OUTPUT_NODE = True
 
@@ -2205,19 +2264,25 @@ class LanceImageUnderstanding:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "lance_model": ("LANCE_MODEL", _ui("Lance 模型", "Lance Load Model 节点输出。")),
-                "image": ("IMAGE", _ui("图片", "ComfyUI IMAGE 输入。")),
+                "lance_model": ("LANCE_MODEL", _ui("shared.lance_model", "Lance Model", "Output from the Lance Load Model node.")),
+                "image": ("IMAGE", _ui("image_understanding.image", "Image", "ComfyUI IMAGE input.")),
                 "question": (
                     "STRING",
-                    _ui("问题", "图片理解问题；可使用中文或英文。", default="请详细描述这张图片。", multiline=True),
+                    _ui(
+                        "image_understanding.question",
+                        "Question",
+                        "Image understanding question. Chinese and English are both supported.",
+                        default=_tr_text("defaults.image_question", "Describe this image in detail."),
+                        multiline=True,
+                    ),
                 ),
                 "max_new_tokens": (
                     "INT",
-                    _ui("Max New Tokens", "理解任务最大生成 token 数。", default=256, min=1, max=2048, step=1),
+                    _ui("shared.max_new_tokens", "Max New Tokens", "Maximum number of tokens generated for understanding tasks.", default=256, min=1, max=2048, step=1),
                 ),
                 "batch_index": (
                     "INT",
-                    _ui("Batch Index", "从批量 IMAGE 中选择第几张图。", default=0, min=0, max=4096, step=1),
+                    _ui("shared.batch_index", "Batch Index", "Select which image to use from a batched IMAGE input.", default=0, min=0, max=4096, step=1),
                 ),
             }
         }
@@ -2236,23 +2301,23 @@ class LanceImageUnderstanding:
 
 class LanceImageGeneration:
     CATEGORY = CATEGORY
-    DESCRIPTION = "使用 Lance 文生图，输出 ComfyUI IMAGE。"
+    DESCRIPTION = _tr_text("descriptions.LanceImageGeneration", "Use Lance text-to-image generation and output a ComfyUI IMAGE.")
     RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("图片", "路径")
+    RETURN_NAMES = _tr_names("return_names.LanceImageGeneration", ("Image", "Path"))
     FUNCTION = "generate"
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "lance_model": ("LANCE_MODEL", _ui("Lance 模型", "Lance Load Model 节点输出。")),
-                "prompt": ("STRING", _ui("Prompt", "文生图提示词。", default="", multiline=True)),
-                "width": ("INT", _ui("宽度", "目标图片宽度。", default=768, min=128, max=2048, step=8)),
-                "height": ("INT", _ui("高度", "目标图片高度。", default=768, min=128, max=2048, step=8)),
+                "lance_model": ("LANCE_MODEL", _ui("shared.lance_model", "Lance Model", "Output from the Lance Load Model node.")),
+                "prompt": ("STRING", _ui("image_generation.prompt", "Prompt", "Text-to-image prompt.", default="", multiline=True)),
+                "width": ("INT", _ui("image_generation.width", "Width", "Target image width.", default=768, min=128, max=2048, step=8)),
+                "height": ("INT", _ui("image_generation.height", "Height", "Target image height.", default=768, min=128, max=2048, step=8)),
                 **COMMON_GENERATION_INPUTS,
                 "resolution": (
                     ["auto", "image_768res", "image_512res", "image_256res"],
-                    _ui("Resolution Preset", "Lance 数据预处理 resolution 预设；auto 使用 demo 默认值。", default="auto"),
+                    _ui("image_generation.resolution", "Resolution Preset", "Lance data preprocessing resolution preset. auto uses the demo default.", default="auto"),
                 ),
             }
         }
@@ -2295,28 +2360,28 @@ class LanceImageGeneration:
 
 class LanceImageEditing:
     CATEGORY = CATEGORY
-    DESCRIPTION = "使用 Lance 图片编辑，输入/输出使用 ComfyUI IMAGE。"
+    DESCRIPTION = _tr_text("descriptions.LanceImageEditing", "Use Lance image editing with ComfyUI IMAGE input and output.")
     RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("图片", "路径")
+    RETURN_NAMES = _tr_names("return_names.LanceImageEditing", ("Image", "Path"))
     FUNCTION = "edit"
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "lance_model": ("LANCE_MODEL", _ui("Lance 模型", "Lance Load Model 节点输出。")),
-                "image": ("IMAGE", _ui("输入图片", "要编辑的 ComfyUI IMAGE。")),
-                "prompt": ("STRING", _ui("编辑指令", "图片编辑指令。", default="", multiline=True)),
-                "width": ("INT", _ui("宽度", "目标图片宽度。", default=768, min=128, max=2048, step=8)),
-                "height": ("INT", _ui("高度", "目标图片高度。", default=768, min=128, max=2048, step=8)),
+                "lance_model": ("LANCE_MODEL", _ui("shared.lance_model", "Lance Model", "Output from the Lance Load Model node.")),
+                "image": ("IMAGE", _ui("image_editing.image", "Input Image", "ComfyUI IMAGE to edit.")),
+                "prompt": ("STRING", _ui("image_editing.prompt", "Edit Instruction", "Image editing instruction.", default="", multiline=True)),
+                "width": ("INT", _ui("image_generation.width", "Width", "Target image width.", default=768, min=128, max=2048, step=8)),
+                "height": ("INT", _ui("image_generation.height", "Height", "Target image height.", default=768, min=128, max=2048, step=8)),
                 **COMMON_GENERATION_INPUTS,
                 "resolution": (
                     ["auto", "image_768res", "image_512res", "image_256res"],
-                    _ui("Resolution Preset", "Lance 数据预处理 resolution 预设；auto 使用 demo 默认值。", default="auto"),
+                    _ui("image_generation.resolution", "Resolution Preset", "Lance data preprocessing resolution preset. auto uses the demo default.", default="auto"),
                 ),
                 "batch_index": (
                     "INT",
-                    _ui("Batch Index", "从批量 IMAGE 中选择第几张图。", default=0, min=0, max=4096, step=1),
+                    _ui("shared.batch_index", "Batch Index", "Select which image to use from a batched IMAGE input.", default=0, min=0, max=4096, step=1),
                 ),
             }
         }
@@ -2363,9 +2428,9 @@ class LanceImageEditing:
 
 class LanceVideoUnderstanding:
     CATEGORY = CATEGORY
-    DESCRIPTION = "使用 Lance 进行视频理解，输入/输出使用 ComfyUI VIDEO 和 STRING。"
+    DESCRIPTION = _tr_text("descriptions.LanceVideoUnderstanding", "Use Lance for video understanding with ComfyUI VIDEO input and STRING output.")
     RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("回答",)
+    RETURN_NAMES = _tr_names("return_names.LanceVideoUnderstanding", ("Answer",))
     FUNCTION = "understand"
     OUTPUT_NODE = True
 
@@ -2373,19 +2438,25 @@ class LanceVideoUnderstanding:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "lance_model": ("LANCE_MODEL", _ui("Lance 模型", "Lance Load Model 节点输出。")),
-                "video": ("VIDEO", _ui("视频", "ComfyUI VIDEO 输入。")),
+                "lance_model": ("LANCE_MODEL", _ui("shared.lance_model", "Lance Model", "Output from the Lance Load Model node.")),
+                "video": ("VIDEO", _ui("video_understanding.video", "Video", "ComfyUI VIDEO input.")),
                 "question": (
                     "STRING",
-                    _ui("问题", "视频理解问题；可使用中文或英文。", default="请详细描述这个视频。", multiline=True),
+                    _ui(
+                        "video_understanding.question",
+                        "Question",
+                        "Video understanding question. Chinese and English are both supported.",
+                        default=_tr_text("defaults.video_question", "Describe this video in detail."),
+                        multiline=True,
+                    ),
                 ),
                 "max_new_tokens": (
                     "INT",
-                    _ui("Max New Tokens", "理解任务最大生成 token 数。", default=256, min=1, max=2048, step=1),
+                    _ui("shared.max_new_tokens", "Max New Tokens", "Maximum number of tokens generated for understanding tasks.", default=256, min=1, max=2048, step=1),
                 ),
                 "max_duration": (
                     "FLOAT",
-                    _ui("Max Duration", "视频采样时允许的最大时长，单位秒。", default=6.0, min=0.1, max=120.0, step=0.1),
+                    _ui("shared.max_duration", "Max Duration", "Maximum duration allowed for video sampling, in seconds.", default=6.0, min=0.1, max=120.0, step=0.1),
                 ),
             }
         }
@@ -2404,34 +2475,34 @@ class LanceVideoUnderstanding:
 
 
 VIDEO_GENERATION_INPUTS = {
-    "width": ("INT", _ui("宽度", "目标视频宽度。", default=848, min=128, max=2048, step=8)),
-    "height": ("INT", _ui("高度", "目标视频高度。", default=480, min=128, max=2048, step=8)),
-    "num_frames": ("INT", _ui("帧数", "目标视频帧数。", default=50, min=2, max=257, step=1)),
+    "width": ("INT", _ui("video_generation.width", "Width", "Target video width.", default=848, min=128, max=2048, step=8)),
+    "height": ("INT", _ui("video_generation.height", "Height", "Target video height.", default=480, min=128, max=2048, step=8)),
+    "num_frames": ("INT", _ui("video_generation.num_frames", "Frames", "Target number of video frames.", default=50, min=2, max=257, step=1)),
     **COMMON_GENERATION_INPUTS,
     "resolution": (
         ["auto", "video_480p", "video_360p", "video_192p"],
-        _ui("Resolution Preset", "Lance 数据预处理 resolution 预设；auto 使用 demo 默认值。", default="auto"),
+        _ui("video_generation.resolution", "Resolution Preset", "Lance data preprocessing resolution preset. auto uses the demo default.", default="auto"),
     ),
     "max_duration": (
         "FLOAT",
-        _ui("Max Duration", "视频采样时允许的最大时长，单位秒。", default=6.0, min=0.1, max=120.0, step=0.1),
+        _ui("shared.max_duration", "Max Duration", "Maximum duration allowed for video sampling, in seconds.", default=6.0, min=0.1, max=120.0, step=0.1),
     ),
 }
 
 
 class LanceTextToVideo:
     CATEGORY = CATEGORY
-    DESCRIPTION = "使用 Lance 文生视频，输出 ComfyUI VIDEO 和帧 IMAGE。"
+    DESCRIPTION = _tr_text("descriptions.LanceTextToVideo", "Use Lance text-to-video generation and output ComfyUI VIDEO plus IMAGE frames.")
     RETURN_TYPES = ("VIDEO", "IMAGE", "STRING")
-    RETURN_NAMES = ("视频", "帧", "路径")
+    RETURN_NAMES = _tr_names("return_names.LanceTextToVideo", ("Video", "Frames", "Path"))
     FUNCTION = "generate"
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "lance_model": ("LANCE_MODEL", _ui("Lance 模型", "Lance Load Model 节点输出。")),
-                "prompt": ("STRING", _ui("Prompt", "文生视频提示词。", default="", multiline=True)),
+                "lance_model": ("LANCE_MODEL", _ui("shared.lance_model", "Lance Model", "Output from the Lance Load Model node.")),
+                "prompt": ("STRING", _ui("text_to_video.prompt", "Prompt", "Text-to-video prompt.", default="", multiline=True)),
                 **VIDEO_GENERATION_INPUTS,
             }
         }
@@ -2462,22 +2533,22 @@ class LanceTextToVideo:
 
 class LanceImageToVideo:
     CATEGORY = CATEGORY
-    DESCRIPTION = "使用 Lance 图生视频，输入 IMAGE，输出 ComfyUI VIDEO。"
+    DESCRIPTION = _tr_text("descriptions.LanceImageToVideo", "Use Lance image-to-video generation with IMAGE input and ComfyUI VIDEO output.")
     RETURN_TYPES = ("VIDEO", "IMAGE", "STRING")
-    RETURN_NAMES = ("视频", "帧", "路径")
+    RETURN_NAMES = _tr_names("return_names.LanceImageToVideo", ("Video", "Frames", "Path"))
     FUNCTION = "generate"
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "lance_model": ("LANCE_MODEL", _ui("Lance 模型", "Lance Load Model 节点输出。")),
-                "image": ("IMAGE", _ui("参考图片", "图生视频的输入图片。")),
-                "prompt": ("STRING", _ui("Prompt", "图生视频提示词。", default="", multiline=True)),
+                "lance_model": ("LANCE_MODEL", _ui("shared.lance_model", "Lance Model", "Output from the Lance Load Model node.")),
+                "image": ("IMAGE", _ui("image_to_video.image", "Reference Image", "Input image for image-to-video generation.")),
+                "prompt": ("STRING", _ui("image_to_video.prompt", "Prompt", "Image-to-video prompt.", default="", multiline=True)),
                 **VIDEO_GENERATION_INPUTS,
                 "batch_index": (
                     "INT",
-                    _ui("Batch Index", "从批量 IMAGE 中选择第几张图。", default=0, min=0, max=4096, step=1),
+                    _ui("shared.batch_index", "Batch Index", "Select which image to use from a batched IMAGE input.", default=0, min=0, max=4096, step=1),
                 ),
             }
         }
@@ -2510,18 +2581,18 @@ class LanceImageToVideo:
 
 class LanceVideoEditing:
     CATEGORY = CATEGORY
-    DESCRIPTION = "使用 Lance 视频编辑，输入/输出使用 ComfyUI VIDEO。"
+    DESCRIPTION = _tr_text("descriptions.LanceVideoEditing", "Use Lance video editing with ComfyUI VIDEO input and output.")
     RETURN_TYPES = ("VIDEO", "IMAGE", "STRING")
-    RETURN_NAMES = ("视频", "帧", "路径")
+    RETURN_NAMES = _tr_names("return_names.LanceVideoEditing", ("Video", "Frames", "Path"))
     FUNCTION = "edit"
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "lance_model": ("LANCE_MODEL", _ui("Lance 模型", "Lance Load Model 节点输出。")),
-                "video": ("VIDEO", _ui("输入视频", "要编辑的 ComfyUI VIDEO。")),
-                "prompt": ("STRING", _ui("编辑指令", "视频编辑指令。", default="", multiline=True)),
+                "lance_model": ("LANCE_MODEL", _ui("shared.lance_model", "Lance Model", "Output from the Lance Load Model node.")),
+                "video": ("VIDEO", _ui("video_editing.video", "Input Video", "ComfyUI VIDEO to edit.")),
+                "prompt": ("STRING", _ui("video_editing.prompt", "Edit Instruction", "Video editing instruction.", default="", multiline=True)),
                 **VIDEO_GENERATION_INPUTS,
             }
         }
@@ -2554,17 +2625,17 @@ class LanceVideoEditing:
 
 class LanceFramesToVideo:
     CATEGORY = CATEGORY
-    DESCRIPTION = "将 ComfyUI IMAGE 帧打包为 ComfyUI VIDEO，便于和 Lance 视频节点连接。"
+    DESCRIPTION = _tr_text("descriptions.LanceFramesToVideo", "Pack ComfyUI IMAGE frames into a ComfyUI VIDEO for connecting with Lance video nodes.")
     RETURN_TYPES = ("VIDEO",)
-    RETURN_NAMES = ("视频",)
+    RETURN_NAMES = _tr_names("return_names.LanceFramesToVideo", ("Video",))
     FUNCTION = "convert"
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE", _ui("帧", "ComfyUI IMAGE 帧序列。")),
-                "fps": ("FLOAT", _ui("FPS", "输出 VIDEO 的帧率。", default=12.0, min=0.1, max=240.0, step=0.1)),
+                "images": ("IMAGE", _ui("frames_to_video.images", "Frames", "ComfyUI IMAGE frame sequence.")),
+                "fps": ("FLOAT", _ui("frames_to_video.fps", "FPS", "Frame rate of the output VIDEO.", default=12.0, min=0.1, max=240.0, step=0.1)),
             }
         }
 
@@ -2574,9 +2645,9 @@ class LanceFramesToVideo:
 
 class LanceUnloadModel:
     CATEGORY = CATEGORY
-    DESCRIPTION = "释放 Lance 模型缓存，并可清理 CUDA 显存。"
+    DESCRIPTION = _tr_text("descriptions.LanceUnloadModel", "Release the Lance model cache and optionally clear CUDA VRAM.")
     RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("状态",)
+    RETURN_NAMES = _tr_names("return_names.LanceUnloadModel", ("Status",))
     FUNCTION = "release"
     OUTPUT_NODE = True
 
@@ -2584,8 +2655,8 @@ class LanceUnloadModel:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "lance_model": ("LANCE_MODEL", _ui("Lance 模型", "要释放的 Lance 模型句柄。")),
-                "clear_cuda_cache": ("BOOLEAN", _ui("清理 CUDA Cache", "释放后清理 CUDA cache。", default=True)),
+                "lance_model": ("LANCE_MODEL", _ui("unload_model.lance_model", "Lance Model", "Lance model handle to release.")),
+                "clear_cuda_cache": ("BOOLEAN", _ui("unload_model.clear_cuda_cache", "Clear CUDA Cache", "Clear CUDA cache after releasing the model.", default=True)),
             }
         }
 
@@ -2606,15 +2677,18 @@ NODE_CLASS_MAPPINGS = {
     "LanceUnloadModel": LanceUnloadModel,
 }
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "LanceLoadModel": "Lance 加载模型",
-    "LanceImageUnderstanding": "Lance 图片理解",
-    "LanceImageGeneration": "Lance 图片生成",
-    "LanceImageEditing": "Lance 图片编辑",
-    "LanceVideoUnderstanding": "Lance 视频理解",
-    "LanceImageToVideo": "Lance 图片生成视频",
-    "LanceTextToVideo": "Lance 文字生成视频",
-    "LanceVideoEditing": "Lance 视频编辑",
-    "LanceFramesToVideo": "Lance 帧转视频",
-    "LanceUnloadModel": "Lance 释放模型",
-}
+NODE_DISPLAY_NAME_MAPPINGS = _tr_mapping(
+    "node_display_names",
+    {
+        "LanceLoadModel": "Lance Load Model",
+        "LanceImageUnderstanding": "Lance Image Understanding",
+        "LanceImageGeneration": "Lance Image Generation",
+        "LanceImageEditing": "Lance Image Editing",
+        "LanceVideoUnderstanding": "Lance Video Understanding",
+        "LanceImageToVideo": "Lance Image to Video",
+        "LanceTextToVideo": "Lance Text to Video",
+        "LanceVideoEditing": "Lance Video Editing",
+        "LanceFramesToVideo": "Lance Frames to Video",
+        "LanceUnloadModel": "Lance Unload Model",
+    },
+)
